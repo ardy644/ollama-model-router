@@ -8,6 +8,7 @@ Built for **constrained hardware** — designed to run comfortably on a 4 GB VRA
 
 ## ✨ Features
 
+- **Interactive Web Chat UI** — Built-in responsive dark-mode chat interface served directly at `http://127.0.0.1:8000/` with live model badge, token metrics, and collapsible reasoning traces
 - **Smart Auto-Routing** — Automatically classifies prompts and routes them to the best model using regex keyword heuristics
 - **VRAM-Safe** — Enforces `num_ctx` on every Ollama request to prevent KV-cache overflow on low-VRAM GPUs
 - **Think-Tag Processing** — Parses and optionally strips `<think>...</think>` blocks from DeepSeek reasoning output
