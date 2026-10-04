@@ -863,9 +863,16 @@ INDEX_HTML = """<!DOCTYPE html>
         });
 
         if (!res.ok) {
-          const err = await res.json();
+          let errorDetail = 'Request failed (' + res.status + ')';
+          try {
+            const err = await res.json();
+            errorDetail = err.detail || JSON.stringify(err);
+          } catch (e) {
+            const textErr = await res.text();
+            if (textErr) errorDetail = textErr;
+          }
           placeholder.remove();
-          const errPayload = { role: 'bot', content: '❌ Error: ' + (err.detail || 'Request failed') };
+          const errPayload = { role: 'bot', content: '❌ Error: ' + errorDetail };
           chat.messages.push(errPayload);
           renderMessageDOM(errPayload);
           return;
@@ -1070,6 +1077,8 @@ async def stream_chat_generator(payload: dict, target_model: str):
                 yield "data: [DONE]\n\n"
     except httpx.ConnectError:
         yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
 
 async def stream_openai_generator(payload: dict, target_model: str, completion_id: str):
@@ -1106,6 +1115,8 @@ async def stream_openai_generator(payload: dict, target_model: str, completion_i
                 yield "data: [DONE]\n\n"
     except httpx.ConnectError:
         yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
 
 # ---- POST /v1/chat -------------------------------------------------------
