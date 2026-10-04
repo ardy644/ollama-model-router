@@ -97,6 +97,45 @@ def test_manual_model_override():
     print("  ✅ PASSED — routed to gemma3:1b")
 
 
+def test_personas_endpoint():
+    separator("Test 4: Model Customization & Personas List")
+    r = httpx.get(f"{BASE_URL}/v1/personas", timeout=10.0)
+    data = r.json()
+
+    print(f"  Status:   {r.status_code}")
+    print(f"  Personas: {list(data.get('personas', {}).keys())}")
+
+    assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+    assert "coder" in data["personas"], "Expected 'coder' persona"
+    assert "reasoner" in data["personas"], "Expected 'reasoner' persona"
+    print("  ✅ PASSED — personas configured and accessible")
+
+
+def test_openai_chat_completions():
+    separator("Test 5: OpenAI-Compatible /v1/chat/completions")
+    payload = {
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "What is 2 + 2? Reply with just the number."},
+        ],
+        "temperature": 0.1,
+    }
+    r = httpx.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=TIMEOUT)
+    data = r.json()
+
+    print(f"  Status:  {r.status_code}")
+    print(f"  ID:      {data.get('id')}")
+    print(f"  Object:  {data.get('object')}")
+    print(f"  Model:   {data.get('model')}")
+    print(f"  Reply:   {data.get('choices', [{}])[0].get('message', {}).get('content')}")
+
+    assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+    assert data["object"] == "chat.completion", f"Expected chat.completion, got {data.get('object')}"
+    assert len(data.get("choices", [])) > 0, "Expected at least one choice"
+    print("  ✅ PASSED — OpenAI compatibility verified")
+
+
 # --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
@@ -106,9 +145,11 @@ if __name__ == "__main__":
     print(f"   Target: {BASE_URL}")
 
     try:
+        test_personas_endpoint()
         test_auto_code_routing()
         test_auto_reasoning_routing()
         test_manual_model_override()
+        test_openai_chat_completions()
     except httpx.ConnectError:
         print("\n❌ FAILED — Could not connect to the FastAPI server.")
         print(f"   Make sure it's running at {BASE_URL}")
@@ -117,4 +158,4 @@ if __name__ == "__main__":
         print(f"\n❌ FAILED — {e}")
         sys.exit(1)
 
-    print("\n🎉 All 3 tests passed!")
+    print("\n🎉 All 5 tests passed!")

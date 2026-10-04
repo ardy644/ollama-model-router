@@ -8,13 +8,15 @@ Built for **constrained hardware** — designed to run comfortably on a 4 GB VRA
 
 ## ✨ Features
 
-- **Interactive Web Chat UI** — Built-in responsive dark-mode chat interface served directly at `http://127.0.0.1:8000/` with live model badge, token metrics, and collapsible reasoning traces
+- **ChatGPT & Gemini-Grade Web UI** — Responsive dark-mode interface with collapsible sidebar, multi-chat local history, markdown rendering, syntax-highlighted code with copy buttons, and collapsible thinking process drawers
+- **Model Customization & Personas** — Pre-configured system prompt presets (`Senior Coder`, `Math & Logic Tutor`, `Executive Summarizer`, `General Assistant`) with tailored temperatures and formatting constraints
+- **OpenAI-Compatible Endpoint (`/v1/chat/completions`)** — Drop-in replacement for OpenAI API; easily connect VS Code (Continue.dev), Obsidian, or standard OpenAI SDKs
+- **Real-Time Token Streaming** — Word-by-word streaming using Server-Sent Events (SSE) for both the Web UI and API clients
 - **Smart Auto-Routing** — Automatically classifies prompts and routes them to the best model using regex keyword heuristics
-- **VRAM-Safe** — Enforces `num_ctx` on every Ollama request to prevent KV-cache overflow on low-VRAM GPUs
+- **VRAM-Safe** — Enforces `num_ctx: 2048` on every Ollama request to prevent KV-cache overflow on low-VRAM GPUs (GTX 1650)
 - **Think-Tag Processing** — Parses and optionally strips `<think>...</think>` blocks from DeepSeek reasoning output
 - **Manual Override** — Bypass auto-routing and target any specific model directly
 - **Health Monitoring** — Built-in health endpoint with Ollama connectivity check
-- **Async** — Fully asynchronous request forwarding via `httpx.AsyncClient`
 
 ---
 

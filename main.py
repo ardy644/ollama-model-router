@@ -6,12 +6,15 @@ Auto-routes prompts to the best model via keyword heuristics,
 enforces VRAM-safe context limits, and strips DeepSeek <think> tags.
 """
 
+import json
 import re
+import time
+import uuid
 from typing import Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -20,6 +23,7 @@ from pydantic import BaseModel, Field
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
 OLLAMA_GENERATE = f"{OLLAMA_BASE}/api/generate"
+OLLAMA_CHAT = f"{OLLAMA_BASE}/api/chat"
 OLLAMA_TIMEOUT = 120.0  # seconds
 
 ALLOWED_MODELS = [
@@ -30,6 +34,46 @@ ALLOWED_MODELS = [
     "qwen2.5-coder:1.5b-base",
 ]
 INSTALLED_MODELS = ALLOWED_MODELS[1:]  # everything except "auto"
+
+# ---------------------------------------------------------------------------
+# Persona & System Prompt Presets
+# ---------------------------------------------------------------------------
+
+PERSONAS = {
+    "general": {
+        "name": "General Assistant",
+        "description": "Balanced, polite, and helpful general-purpose AI.",
+        "system": "You are a helpful, respectful, and honest AI assistant.",
+        "temperature": 0.7,
+    },
+    "coder": {
+        "name": "Senior Software Engineer",
+        "description": "Production-grade code, strict type hints, zero filler.",
+        "system": (
+            "You are a principal software engineer. Provide clean, secure, production-grade code with "
+            "precise type hints and docstrings. Do not include conversational filler or pleasantries."
+        ),
+        "temperature": 0.2,
+    },
+    "reasoner": {
+        "name": "Math & Logic Specialist",
+        "description": "Rigorous step-by-step mathematical reasoning.",
+        "system": (
+            "You are a mathematical and logical reasoning specialist. Work methodically step by step, "
+            "verify every intermediate step, and clearly explain proofs and derivations."
+        ),
+        "temperature": 0.3,
+    },
+    "executive": {
+        "name": "Executive Summarizer",
+        "description": "High-density bullet points, bold metrics, zero fluff.",
+        "system": (
+            "You are an executive chief of staff. Deliver answers with extreme brevity. "
+            "Use bullet points, bold key takeaways, and eliminate all conversational fluff."
+        ),
+        "temperature": 0.3,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Regex patterns for auto-routing
@@ -51,7 +95,7 @@ REASONING_PATTERN = re.compile(
 THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # ---------------------------------------------------------------------------
-# Pydantic request model
+# Pydantic request models
 # ---------------------------------------------------------------------------
 
 
@@ -64,8 +108,27 @@ class ChatRequest(BaseModel):
         "deepseek-r1:1.5b",
         "qwen2.5-coder:1.5b-base",
     ] = "auto"
+    persona: Optional[Literal["general", "coder", "reasoner", "executive", "custom"]] = "general"
+    system_prompt: Optional[str] = None
+    temperature: Optional[float] = None
+    stream: bool = False
     strip_reasoning: bool = True
     context_limit: int = Field(default=2048, ge=512, le=4096)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model: Optional[str] = "auto"
+    messages: list[ChatMessage]
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    stream: Optional[bool] = False
+    context_limit: Optional[int] = Field(default=2048, ge=512, le=4096)
+    persona: Optional[str] = "general"
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +590,12 @@ INDEX_HTML = """<!DOCTYPE html>
           <option value="qwen2.5:3b">💬 Qwen 2.5 3B (General Writing)</option>
           <option value="gemma3:1b">⚡ Gemma 3 1B (Ultra-fast Fallback)</option>
         </select>
+        <select class="model-selector" id="persona-select" title="Model Customization Persona">
+          <option value="general">🎭 Persona: General</option>
+          <option value="coder">💻 Persona: Senior Coder</option>
+          <option value="reasoner">🧠 Persona: Math & Logic</option>
+          <option value="executive">⚡ Persona: Executive Brief</option>
+        </select>
       </div>
       <div class="nav-right">
         <button class="icon-btn" onclick="openSettings()" title="Settings">
@@ -773,8 +842,9 @@ INDEX_HTML = """<!DOCTYPE html>
       chatInner.appendChild(placeholder);
       chatScroll.scrollTop = chatScroll.scrollHeight;
 
-      // 3. API Call
+      // 3. API Call with Streaming & Persona
       const model = modelSelect.value;
+      const persona = document.getElementById('persona-select').value;
       const contextLimit = parseInt(ctxSlider.value, 10);
       const stripReasoning = stripChk.checked;
 
@@ -785,8 +855,10 @@ INDEX_HTML = """<!DOCTYPE html>
           body: JSON.stringify({
             prompt: prompt,
             model: model,
+            persona: persona,
             context_limit: contextLimit,
-            strip_reasoning: stripReasoning
+            strip_reasoning: stripReasoning,
+            stream: true
           })
         });
 
@@ -799,15 +871,70 @@ INDEX_HTML = """<!DOCTYPE html>
           return;
         }
 
-        const data = await res.json();
-        placeholder.remove();
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let fullResponse = '';
+        let targetModel = model === 'auto' ? 'routing...' : model;
+        let evalCount = 0;
+        let thinkContent = '';
+        let isInsideThink = false;
+        let buffer = '';
 
+        const botMsgContent = placeholder.querySelector('.msg-bot-content');
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep remainder
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const dataStr = line.slice(6).trim();
+            if (dataStr === '[DONE]') break;
+            try {
+              const chunk = JSON.parse(dataStr);
+              if (chunk.model) targetModel = chunk.model;
+              if (chunk.eval_count) evalCount = chunk.eval_count;
+              if (chunk.response) {
+                const token = chunk.response;
+                if (token.includes('<think>')) isInsideThink = true;
+                if (isInsideThink) {
+                  thinkContent += token;
+                  if (token.includes('</think>')) isInsideThink = false;
+                } else {
+                  fullResponse += token;
+                }
+
+                // Render live typewriter
+                const cleanThink = thinkContent.replace(/<\/?think>/g, '').trim();
+                const thinkHtml = cleanThink ? `<details class="think-box" open><summary>🧠 Thinking Process...</summary><pre>${escapeHtml(cleanThink)}</pre></details>` : '';
+                const renderedMd = marked.parse(fullResponse || '');
+                botMsgContent.innerHTML = `
+                  <div class="bot-header-badge">⚡ ${escapeHtml(targetModel)} • ${escapeHtml(persona)}</div>
+                  ${thinkHtml}
+                  <div class="markdown-body">${renderedMd}</div>
+                `;
+                chatScroll.scrollTop = chatScroll.scrollHeight;
+              }
+            } catch (e) {}
+          }
+        }
+
+        // Clean thinking tags for final history persistence
+        let finalCleanReasoning = null;
+        if (thinkContent) {
+          finalCleanReasoning = thinkContent.replace(/<\/?think>/g, '').trim();
+        }
+
+        placeholder.remove();
         const botMsg = {
           role: 'bot',
-          content: data.response,
-          model: data.model,
-          reasoning: data.reasoning,
-          tokens: data.tokens
+          content: fullResponse || '(Empty response)',
+          model: targetModel,
+          reasoning: finalCleanReasoning,
+          tokens: { eval_count: evalCount }
         };
         chat.messages.push(botMsg);
         renderMessageDOM(botMsg);
@@ -905,12 +1032,88 @@ async def root():
     return HTMLResponse(content=INDEX_HTML)
 
 
+# ---- Helpers for Personas & Streaming -----------------------------------
+
+
+def resolve_persona_config(
+    persona_key: Optional[str],
+    custom_system: Optional[str],
+    custom_temp: Optional[float],
+) -> tuple[Optional[str], Optional[float]]:
+    """Resolve system prompt and temperature from persona presets and overrides."""
+    system = None
+    temp = None
+    if persona_key and persona_key in PERSONAS:
+        system = PERSONAS[persona_key]["system"]
+        temp = PERSONAS[persona_key]["temperature"]
+    if custom_system:
+        system = custom_system
+    if custom_temp is not None:
+        temp = custom_temp
+    return system, temp
+
+
+async def stream_chat_generator(payload: dict, target_model: str):
+    """Stream token chunks from Ollama as Server-Sent Events (SSE)."""
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+            async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    except Exception:
+                        continue
+                yield "data: [DONE]\n\n"
+    except httpx.ConnectError:
+        yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+
+
+async def stream_openai_generator(payload: dict, target_model: str, completion_id: str):
+    """Stream OpenAI-compatible chat completion chunks."""
+    created_time = int(time.time())
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+            async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        token = chunk.get("response", "")
+                        done = chunk.get("done", False)
+
+                        event = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": target_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token} if not done else {},
+                                    "finish_reason": "stop" if done else None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(event)}\n\n"
+                    except Exception:
+                        continue
+                yield "data: [DONE]\n\n"
+    except httpx.ConnectError:
+        yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+
+
 # ---- POST /v1/chat -------------------------------------------------------
 
 
 @app.post("/v1/chat")
 async def chat(request: ChatRequest):
-    """Send a prompt to Ollama, optionally auto-routing to the best model."""
+    """Send a prompt to Ollama with auto-routing, persona injection, and optional streaming."""
 
     # 1. Resolve target model
     if request.model == "auto":
@@ -924,15 +1127,33 @@ async def chat(request: ChatRequest):
             )
         target_model = request.model
 
-    # 2. Build Ollama payload (always enforce num_ctx for VRAM safety)
+    # 2. Resolve persona system prompt and temperature
+    system_prompt, temp = resolve_persona_config(
+        request.persona, request.system_prompt, request.temperature
+    )
+
+    # 3. Build Ollama payload (enforce num_ctx for VRAM safety)
+    options: dict = {"num_ctx": request.context_limit}
+    if temp is not None:
+        options["temperature"] = temp
+
     payload = {
         "model": target_model,
         "prompt": request.prompt,
-        "stream": False,
-        "options": {"num_ctx": request.context_limit},
+        "stream": request.stream,
+        "options": options,
     }
+    if system_prompt:
+        payload["system"] = system_prompt
 
-    # 3. Forward to Ollama
+    # 4. Handle streaming mode
+    if request.stream:
+        return StreamingResponse(
+            stream_chat_generator(payload, target_model),
+            media_type="text/event-stream",
+        )
+
+    # 5. Non-streaming request
     try:
         async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
             resp = await client.post(OLLAMA_GENERATE, json=payload)
@@ -953,7 +1174,7 @@ async def chat(request: ChatRequest):
     data = resp.json()
     response_text: str = data.get("response", "")
 
-    # 4. Process <think> tags for deepseek-r1
+    # 6. Process <think> tags for deepseek-r1
     reasoning = None
     if target_model == "deepseek-r1:1.5b":
         response_text, reasoning = process_reasoning(
@@ -962,6 +1183,7 @@ async def chat(request: ChatRequest):
 
     return {
         "model": target_model,
+        "persona": request.persona,
         "response": response_text,
         "reasoning": reasoning,
         "tokens": {
@@ -969,6 +1191,112 @@ async def chat(request: ChatRequest):
             "eval_count": data.get("eval_count"),
         },
     }
+
+
+# ---- POST /v1/chat/completions (OpenAI Compatible) -----------------------
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: OpenAIChatCompletionRequest):
+    """OpenAI-compatible chat completion endpoint.
+
+    Allows tools like Continue.dev, Cursor, Obsidian, or official OpenAI SDK
+    to treat this local router as a drop-in OpenAI replacement.
+    """
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="Messages array cannot be empty")
+
+    # Extract user prompt and conversation history
+    system_instruction = None
+    conversation_lines = []
+    last_user_prompt = ""
+
+    for msg in request.messages:
+        if msg.role == "system":
+            system_instruction = msg.content
+        elif msg.role == "user":
+            conversation_lines.append(f"User: {msg.content}")
+            last_user_prompt = msg.content
+        elif msg.role == "assistant":
+            conversation_lines.append(f"Assistant: {msg.content}")
+
+    # Determine target model (auto-route using the last user prompt if auto)
+    if not request.model or request.model == "auto":
+        target_model = classify_prompt(last_user_prompt)
+    elif request.model in INSTALLED_MODELS:
+        target_model = request.model
+    else:
+        target_model = "qwen2.5:3b"  # fallback
+
+    # Resolve persona
+    persona_system, persona_temp = resolve_persona_config(
+        request.persona, system_instruction, request.temperature
+    )
+
+    full_prompt = "\n".join(conversation_lines)
+    options: dict = {"num_ctx": request.context_limit or 2048}
+    if persona_temp is not None:
+        options["temperature"] = persona_temp
+
+    payload = {
+        "model": target_model,
+        "prompt": full_prompt,
+        "stream": bool(request.stream),
+        "options": options,
+    }
+    if persona_system:
+        payload["system"] = persona_system
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+    # Streaming mode
+    if request.stream:
+        return StreamingResponse(
+            stream_openai_generator(payload, target_model, completion_id),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming mode
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+            resp = await client.post(OLLAMA_GENERATE, json=payload)
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Ollama server offline")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Ollama error: {exc.response.text}")
+
+    data = resp.json()
+    response_text = data.get("response", "")
+
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": target_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": response_text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": data.get("prompt_eval_count", 0),
+            "completion_tokens": data.get("eval_count", 0),
+            "total_tokens": (data.get("prompt_eval_count", 0) or 0)
+            + (data.get("eval_count", 0) or 0),
+        },
+    }
+
+
+# ---- GET /v1/personas ----------------------------------------------------
+
+
+@app.get("/v1/personas")
+async def list_personas():
+    """Return available persona presets and their system prompt configurations."""
+    return {"personas": PERSONAS}
 
 
 # ---- GET /v1/models ------------------------------------------------------
