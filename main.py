@@ -10,12 +10,13 @@ import json
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -114,6 +115,12 @@ class ChatRequest(BaseModel):
     stream: bool = False
     strip_reasoning: bool = True
     context_limit: int = Field(default=2048, ge=512, le=4096)
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Prompt cannot be empty or whitespace only")
+        return v
 
 
 class ChatMessage(BaseModel):
@@ -165,22 +172,69 @@ def process_reasoning(
 
 
 # ---------------------------------------------------------------------------
-# FastAPI application
+# FastAPI Application & Lifespan Connection Pooling
 # ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage lifecycle of shared HTTP client with connection pooling."""
+    limits = httpx.Limits(
+        max_connections=20,
+        max_keepalive_connections=10,
+        keepalive_expiry=30.0,
+    )
+    timeout = httpx.Timeout(
+        timeout=OLLAMA_TIMEOUT,
+        connect=10.0,
+    )
+    client = httpx.AsyncClient(
+        limits=limits,
+        timeout=timeout,
+        headers={"User-Agent": "Ollama-Router/1.0"},
+    )
+    app.state.http_client = client
+    try:
+        yield
+    finally:
+        await client.aclose()
+
+
+def get_http_client(request: Request) -> httpx.AsyncClient:
+    """Dependency provider for shared HTTPX async client."""
+    client: Optional[httpx.AsyncClient] = getattr(request.app.state, "http_client", None)
+    if client is None or client.is_closed:
+        return httpx.AsyncClient(timeout=OLLAMA_TIMEOUT)
+    return client
+
 
 app = FastAPI(
     title="Ollama Model Router",
     description="Lightweight local router for Ollama with auto-routing, "
     "VRAM-safe context limits, and DeepSeek think-tag processing.",
     version="1.0.0",
+    lifespan=lifespan,
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global safety net returning structured JSON on any unexpected error."""
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "InternalServerError",
+            "detail": str(exc),
+            "path": request.url.path,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 # Interactive Web UI
 # ---------------------------------------------------------------------------
 
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -524,6 +578,31 @@ INDEX_HTML = """<!DOCTYPE html>
       cursor: pointer;
     }
     button.send-btn.active:hover { background: #e0e0e0; }
+    .stop-btn {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #ececec;
+      font-size: 0.82rem;
+      font-weight: 500;
+      padding: 6px 14px;
+      border-radius: 18px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      pointer-events: auto;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      transition: all 0.15s ease;
+    }
+    .stop-btn:hover {
+      background: #383838;
+      border-color: #666;
+      color: #ff7b72;
+    }
+    .stop-btn svg {
+      color: #ff7b72;
+    }
     .input-footer {
       font-size: 0.72rem;
       color: #777;
@@ -636,6 +715,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <!-- Bottom Input Box -->
     <div class="input-wrapper">
+      <button class="stop-btn" id="stop-btn" onclick="stopGenerating()" title="Cancel generation">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+        <span>Stop Generating</span>
+      </button>
       <div class="input-box">
         <textarea id="prompt-input" rows="1" placeholder="Message Ollama Model Router..."></textarea>
         <button class="send-btn" id="send-btn" onclick="submitMessage()">
@@ -674,19 +757,26 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
-    // State
+    // State & Constants
+    const MAX_CHATS = 50;
     let currentChatId = null;
     let chats = [];
+    let streamAbortController = null;
+
     try {
       const stored = localStorage.getItem('router_chats');
       if (stored) chats = JSON.parse(stored);
       if (!Array.isArray(chats)) chats = [];
+      if (chats.length > MAX_CHATS) {
+        chats = chats.slice(0, MAX_CHATS);
+      }
     } catch (e) {
       chats = [];
     }
 
     const promptInput = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const chatInner = document.getElementById('chat-inner');
     const heroSection = document.getElementById('hero-section');
     const chatScroll = document.getElementById('chat-scroll');
@@ -783,7 +873,15 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
+    function stopGenerating() {
+      if (streamAbortController) {
+        streamAbortController.abort();
+        streamAbortController = null;
+      }
+    }
+
     function startNewChat() {
+      stopGenerating();
       currentChatId = 'chat_' + Date.now();
       chats.unshift({ id: currentChatId, title: 'New Conversation', messages: [] });
       saveChats();
@@ -791,6 +889,9 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function loadChat(id) {
+      if (currentChatId !== id) {
+        stopGenerating();
+      }
       currentChatId = id;
       const chat = chats.find(c => c && c.id === id);
       if (!chatInner) return;
@@ -813,6 +914,9 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function deleteChat(e, id) {
       if (e) e.stopPropagation();
+      if (currentChatId === id) {
+        stopGenerating();
+      }
       chats = chats.filter(c => c && c.id !== id);
       saveChats();
       if (currentChatId === id) {
@@ -825,8 +929,22 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function saveChats() {
       try {
+        if (chats.length > MAX_CHATS) {
+          chats = chats.slice(0, MAX_CHATS);
+        }
         localStorage.setItem('router_chats', JSON.stringify(chats));
-      } catch (e) {}
+      } catch (e) {
+        console.warn('localStorage quota warning or error:', e);
+        try {
+          while (chats.length > 10) {
+            chats.pop();
+            try {
+              localStorage.setItem('router_chats', JSON.stringify(chats));
+              break;
+            } catch (innerErr) {}
+          }
+        } catch (ignored) {}
+      }
     }
 
     function fillAndSend(text) {
@@ -891,10 +1009,15 @@ INDEX_HTML = """<!DOCTYPE html>
       const contextLimit = ctxSlider ? parseInt(ctxSlider.value, 10) : 2048;
       const stripReasoning = stripChk ? stripChk.checked : true;
 
+      stopGenerating();
+      streamAbortController = new AbortController();
+      if (stopBtn) stopBtn.style.display = 'inline-flex';
+
       try {
         const res = await fetch('/v1/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: streamAbortController.signal,
           body: JSON.stringify({
             prompt: prompt,
             model: model,
@@ -1000,13 +1123,37 @@ INDEX_HTML = """<!DOCTYPE html>
 
       } catch (err) {
         placeholder.remove();
-        const errPayload = { role: 'bot', content: '❌ Network Error: ' + err.message };
-        if (chat) chat.messages.push(errPayload);
-        renderMessageDOM(errPayload);
+        if (err.name === 'AbortError') {
+          let finalCleanReasoning = null;
+          if (thinkContent) {
+            finalCleanReasoning = thinkContent.replace(/<\/?think>/g, '').trim();
+          }
+          const botMsg = {
+            role: 'bot',
+            content: fullResponse ? (fullResponse + ' *(generation stopped)*') : '*(Generation stopped by user)*',
+            model: targetModel,
+            reasoning: finalCleanReasoning,
+            tokens: { eval_count: evalCount }
+          };
+          if (chat) chat.messages.push(botMsg);
+          renderMessageDOM(botMsg);
+          saveChats();
+          renderHistory();
+        } else {
+          const errPayload = { role: 'bot', content: '❌ Network Error: ' + err.message };
+          if (chat) chat.messages.push(errPayload);
+          renderMessageDOM(errPayload);
+        }
       } finally {
+        streamAbortController = null;
+        if (stopBtn) stopBtn.style.display = 'none';
         if (sendBtn) {
           sendBtn.disabled = false;
-          sendBtn.classList.remove('active');
+          if (promptInput && promptInput.value.trim().length > 0) {
+            sendBtn.classList.add('active');
+          } else {
+            sendBtn.classList.remove('active');
+          }
         }
         if (promptInput) promptInput.focus();
       }
@@ -1130,61 +1277,67 @@ def resolve_persona_config(
     return system, temp
 
 
-async def stream_chat_generator(payload: dict, target_model: str):
+async def stream_chat_generator(
+    client: httpx.AsyncClient, payload: dict, target_model: str
+):
     """Stream token chunks from Ollama as Server-Sent Events (SSE)."""
     try:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-            async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    except Exception:
-                        continue
-                yield "data: [DONE]\n\n"
+        async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                except Exception:
+                    continue
+            yield "data: [DONE]\n\n"
     except httpx.ConnectError:
-        yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+        yield f"data: {json.dumps({'error': 'Ollama server offline or unreachable'})}\n\n"
+    except httpx.TimeoutException:
+        yield f"data: {json.dumps({'error': 'Upstream request timed out'})}\n\n"
     except Exception as exc:
         yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
 
-async def stream_openai_generator(payload: dict, target_model: str, completion_id: str):
+async def stream_openai_generator(
+    client: httpx.AsyncClient, payload: dict, target_model: str, completion_id: str
+):
     """Stream OpenAI-compatible chat completion chunks."""
     created_time = int(time.time())
     try:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-            async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                        token = chunk.get("response", "")
-                        done = chunk.get("done", False)
+        async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    token = chunk.get("response", "")
+                    done = chunk.get("done", False)
 
-                        event = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": target_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": token} if not done else {},
-                                    "finish_reason": "stop" if done else None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(event)}\n\n"
-                    except Exception:
-                        continue
-                yield "data: [DONE]\n\n"
+                    event = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token} if not done else {},
+                                "finish_reason": "stop" if done else None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(event)}\n\n"
+                except Exception:
+                    continue
+            yield "data: [DONE]\n\n"
     except httpx.ConnectError:
-        yield f"data: {json.dumps({'error': 'Ollama server offline'})}\n\n"
+        yield f"data: {json.dumps({'error': 'Ollama server offline or unreachable'})}\n\n"
+    except httpx.TimeoutException:
+        yield f"data: {json.dumps({'error': 'Upstream request timed out'})}\n\n"
     except Exception as exc:
         yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
@@ -1193,7 +1346,10 @@ async def stream_openai_generator(payload: dict, target_model: str, completion_i
 
 
 @app.post("/v1/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
     """Send a prompt to Ollama with auto-routing, persona injection, and optional streaming."""
 
     # 1. Resolve target model
@@ -1232,20 +1388,24 @@ async def chat(request: ChatRequest):
     # 4. Handle streaming mode
     if request.stream:
         return StreamingResponse(
-            stream_chat_generator(payload, target_model),
+            stream_chat_generator(client, payload, target_model),
             media_type="text/event-stream",
         )
 
     # 5. Non-streaming request
     try:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-            resp = await client.post(OLLAMA_GENERATE, json=payload)
-            resp.raise_for_status()
+        resp = await client.post(OLLAMA_GENERATE, json=payload)
+        resp.raise_for_status()
     except httpx.ConnectError:
         raise HTTPException(
             status_code=503,
             detail="Ollama server is offline or unreachable at "
             f"{OLLAMA_BASE}. Please start Ollama and try again.",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Inference request timed out after {OLLAMA_TIMEOUT}s.",
         )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
@@ -1280,7 +1440,10 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: OpenAIChatCompletionRequest):
+async def chat_completions(
+    request: OpenAIChatCompletionRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
     """OpenAI-compatible chat completion endpoint.
 
     Allows tools like Continue.dev, Cursor, Obsidian, or official OpenAI SDK
@@ -1309,7 +1472,7 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
     elif request.model in INSTALLED_MODELS:
         target_model = request.model
     else:
-        target_model = "qwen2.5:3b"  # fallback
+        target_model = "gemma3:1b"  # fallback
 
     # Resolve persona
     persona_system, persona_temp = resolve_persona_config(
@@ -1337,19 +1500,31 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
     # Streaming mode
     if request.stream:
         return StreamingResponse(
-            stream_openai_generator(payload, target_model, completion_id),
+            stream_openai_generator(client, payload, target_model, completion_id),
             media_type="text/event-stream",
         )
 
     # Non-streaming mode
     try:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-            resp = await client.post(OLLAMA_GENERATE, json=payload)
-            resp.raise_for_status()
+        resp = await client.post(OLLAMA_GENERATE, json=payload)
+        resp.raise_for_status()
     except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Ollama server offline")
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama server is offline or unreachable at "
+            f"{OLLAMA_BASE}. Please start Ollama and try again.",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Inference request timed out after {OLLAMA_TIMEOUT}s.",
+        )
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama error: {exc.response.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama returned an error: {exc.response.status_code} — "
+            f"{exc.response.text}",
+        )
 
     data = resp.json()
     response_text = data.get("response", "")
@@ -1404,7 +1579,7 @@ async def list_models():
                 "proof, theorem, math, equation, reason, derive, deduce, "
                 "explain why, analyze"
             ),
-            "default_fallback": "qwen2.5:3b",
+            "default_fallback": "gemma3:1b",
         },
     }
 
@@ -1413,13 +1588,12 @@ async def list_models():
 
 
 @app.get("/health")
-async def health():
+async def health(client: httpx.AsyncClient = Depends(get_http_client)):
     """Check service health and Ollama connectivity."""
     ollama_ok = False
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{OLLAMA_BASE}/")
-            ollama_ok = resp.status_code == 200
+        resp = await client.get(f"{OLLAMA_BASE}/", timeout=5.0)
+        ollama_ok = resp.status_code == 200
     except Exception:
         pass
     return {"status": "healthy", "ollama_connected": ollama_ok}

@@ -11,7 +11,8 @@ import sys
 import io
 
 # Fix Windows console encoding so emoji/unicode prints don't crash
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import httpx
 
@@ -137,6 +138,98 @@ def test_openai_chat_completions():
 
 
 # --------------------------------------------------------------------------
+# Negative & Resilience Tests
+# --------------------------------------------------------------------------
+
+def test_rejection_empty_or_whitespace_prompt():
+    separator("Negative Test 1: Rejection of Empty/Whitespace Prompt")
+
+    # 1. Empty string prompt
+    payload_empty = {"prompt": ""}
+    r_empty = httpx.post(f"{BASE_URL}/v1/chat", json=payload_empty, timeout=10.0)
+    print(f"  Empty prompt status:      {r_empty.status_code}")
+    assert r_empty.status_code == 422, f"Expected 422 for empty prompt, got {r_empty.status_code}"
+
+    # 2. Whitespace-only prompt
+    payload_whitespace = {"prompt": "   \n\t   "}
+    r_ws = httpx.post(f"{BASE_URL}/v1/chat", json=payload_whitespace, timeout=10.0)
+    print(f"  Whitespace prompt status: {r_ws.status_code}")
+    assert r_ws.status_code == 422, f"Expected 422 for whitespace prompt, got {r_ws.status_code}"
+
+    # 3. Missing prompt field
+    r_missing = httpx.post(f"{BASE_URL}/v1/chat", json={}, timeout=10.0)
+    print(f"  Missing prompt status:    {r_missing.status_code}")
+    assert r_missing.status_code == 422, f"Expected 422 for missing prompt, got {r_missing.status_code}"
+
+    print("  ✅ PASSED — empty/whitespace/missing prompt correctly rejected with 422")
+
+
+def test_rejection_invalid_model():
+    separator("Negative Test 2: Rejection of Invalid Model Name")
+    payload = {
+        "prompt": "Hello world",
+        "model": "non-existent-gpt-99",
+    }
+    r = httpx.post(f"{BASE_URL}/v1/chat", json=payload, timeout=10.0)
+    print(f"  Invalid model status: {r.status_code}")
+    print(f"  Detail: {r.json().get('detail')}")
+
+    assert r.status_code in (400, 422), f"Expected 400 or 422, got {r.status_code}"
+    print(f"  ✅ PASSED — invalid model correctly rejected with {r.status_code}")
+
+
+def test_out_of_bounds_context_limit():
+    separator("Negative Test 3: Out-of-Bounds Context Limit Bounds (512 - 4096)")
+
+    # 1. Lower bound violation (context_limit < 512)
+    payload_low = {
+        "prompt": "Hello world",
+        "context_limit": 100,
+    }
+    r_low = httpx.post(f"{BASE_URL}/v1/chat", json=payload_low, timeout=10.0)
+    print(f"  context_limit=100 status: {r_low.status_code}")
+    assert r_low.status_code == 422, f"Expected 422 for context_limit=100, got {r_low.status_code}"
+
+    # 2. Upper bound violation (context_limit > 4096)
+    payload_high = {
+        "prompt": "Hello world",
+        "context_limit": 10000,
+    }
+    r_high = httpx.post(f"{BASE_URL}/v1/chat", json=payload_high, timeout=10.0)
+    print(f"  context_limit=10000 status: {r_high.status_code}")
+    assert r_high.status_code == 422, f"Expected 422 for context_limit=10000, got {r_high.status_code}"
+
+    # 3. Completions endpoint lower bound violation
+    payload_comp = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "context_limit": 100,
+    }
+    r_comp = httpx.post(f"{BASE_URL}/v1/chat/completions", json=payload_comp, timeout=10.0)
+    print(f"  /v1/chat/completions context_limit=100 status: {r_comp.status_code}")
+    assert r_comp.status_code == 422, f"Expected 422 for completions context_limit=100, got {r_comp.status_code}"
+
+    print("  ✅ PASSED — out-of-bounds context limits correctly rejected with 422")
+
+
+def test_rejection_empty_messages_array():
+    separator("Negative Test 4: Rejection of Empty Messages in /v1/chat/completions")
+    payload = {
+        "model": "auto",
+        "messages": [],
+    }
+    r = httpx.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=10.0)
+    data = r.json()
+    print(f"  Status: {r.status_code}")
+    print(f"  Detail: {data.get('detail')}")
+
+    assert r.status_code == 400, f"Expected 400, got {r.status_code}"
+    assert data.get("detail") == "Messages array cannot be empty", (
+        f"Unexpected detail message: {data.get('detail')}"
+    )
+    print("  ✅ PASSED — empty messages array correctly rejected with 400")
+
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 
@@ -145,11 +238,18 @@ if __name__ == "__main__":
     print(f"   Target: {BASE_URL}")
 
     try:
+        # Happy Path Tests
         test_personas_endpoint()
         test_auto_code_routing()
         test_auto_reasoning_routing()
         test_manual_model_override()
         test_openai_chat_completions()
+
+        # Negative & Resilience Tests
+        test_rejection_empty_or_whitespace_prompt()
+        test_rejection_invalid_model()
+        test_out_of_bounds_context_limit()
+        test_rejection_empty_messages_array()
     except httpx.ConnectError:
         print("\n❌ FAILED — Could not connect to the FastAPI server.")
         print(f"   Make sure it's running at {BASE_URL}")
@@ -158,4 +258,4 @@ if __name__ == "__main__":
         print(f"\n❌ FAILED — {e}")
         sys.exit(1)
 
-    print("\n🎉 All 5 tests passed!")
+    print("\n🎉 All 9 tests passed (5 Happy Path + 4 Negative/Edge Case)!")
