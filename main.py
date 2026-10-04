@@ -139,13 +139,13 @@ class OpenAIChatCompletionRequest(BaseModel):
 def classify_prompt(prompt: str) -> str:
     """Route a prompt to the best model using keyword heuristics.
 
-    Priority: Coding → Reasoning → General fallback (qwen2.5:3b).
+    Priority: Coding → Reasoning → Ultra-fast fallback (gemma3:1b).
     """
     if CODING_PATTERN.search(prompt):
         return "qwen2.5-coder:1.5b-base"
     if REASONING_PATTERN.search(prompt):
         return "deepseek-r1:1.5b"
-    return "qwen2.5:3b"
+    return "gemma3:1b"
 
 
 def process_reasoning(
@@ -1217,6 +1217,8 @@ async def chat(request: ChatRequest):
     options: dict = {"num_ctx": request.context_limit}
     if temp is not None:
         options["temperature"] = temp
+    if target_model == "qwen2.5:3b":
+        options["num_gpu"] = 0  # 3B params exceed 4GB VRAM with desktop overhead; offload safely to CPU
 
     payload = {
         "model": target_model,
@@ -1318,6 +1320,8 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
     options: dict = {"num_ctx": request.context_limit or 2048}
     if persona_temp is not None:
         options["temperature"] = persona_temp
+    if target_model == "qwen2.5:3b":
+        options["num_gpu"] = 0
 
     payload = {
         "model": target_model,
