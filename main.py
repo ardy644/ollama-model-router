@@ -676,7 +676,14 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     // State
     let currentChatId = null;
-    let chats = JSON.parse(localStorage.getItem('router_chats') || '[]');
+    let chats = [];
+    try {
+      const stored = localStorage.getItem('router_chats');
+      if (stored) chats = JSON.parse(stored);
+      if (!Array.isArray(chats)) chats = [];
+    } catch (e) {
+      chats = [];
+    }
 
     const promptInput = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
@@ -688,37 +695,51 @@ INDEX_HTML = """<!DOCTYPE html>
     const ctxVal = document.getElementById('modal-ctx-val');
     const stripChk = document.getElementById('modal-strip-chk');
 
-    // Auto-grow textarea
-    promptInput.addEventListener('input', () => {
-      promptInput.style.height = 'auto';
-      promptInput.style.height = Math.min(promptInput.scrollHeight, 200) + 'px';
-      if (promptInput.value.trim().length > 0) {
-        sendBtn.classList.add('active');
-      } else {
-        sendBtn.classList.remove('active');
-      }
-    });
+    // 1. Attach Event Listeners FIRST so input is always responsive
+    if (promptInput) {
+      promptInput.addEventListener('input', () => {
+        promptInput.style.height = 'auto';
+        promptInput.style.height = Math.min(promptInput.scrollHeight, 200) + 'px';
+        if (sendBtn) {
+          if (promptInput.value.trim().length > 0) {
+            sendBtn.classList.add('active');
+            sendBtn.disabled = false;
+          } else {
+            sendBtn.classList.remove('active');
+          }
+        }
+      });
 
-    promptInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        submitMessage();
-      }
-    });
+      promptInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          submitMessage();
+        }
+      });
+    }
 
-    ctxSlider.addEventListener('input', (e) => {
-      ctxVal.textContent = e.target.value;
-    });
+    if (sendBtn) {
+      sendBtn.onclick = () => submitMessage();
+    }
+
+    if (ctxSlider && ctxVal) {
+      ctxSlider.addEventListener('input', (e) => {
+        ctxVal.textContent = e.target.value;
+      });
+    }
 
     // Sidebar & Modal Toggles
     function toggleSidebar() {
-      document.getElementById('sidebar').classList.toggle('collapsed');
+      const sb = document.getElementById('sidebar');
+      if (sb) sb.classList.toggle('collapsed');
     }
     function openSettings() {
-      document.getElementById('settings-modal').classList.add('open');
+      const modal = document.getElementById('settings-modal');
+      if (modal) modal.classList.add('open');
     }
-    function closeSettings() {
-      document.getElementById('settings-modal').classList.remove('open');
+    function closeSettings(e) {
+      const modal = document.getElementById('settings-modal');
+      if (modal) modal.classList.remove('open');
     }
 
     // Health check
@@ -728,16 +749,20 @@ INDEX_HTML = """<!DOCTYPE html>
         const data = await res.json();
         const dot = document.getElementById('sidebar-dot');
         const txt = document.getElementById('sidebar-status');
-        if (data.ollama_connected) {
-          dot.className = 'status-dot online';
-          txt.textContent = 'Ollama Connected';
-        } else {
-          dot.className = 'status-dot offline';
-          txt.textContent = 'Ollama Offline';
+        if (dot && txt) {
+          if (data.ollama_connected) {
+            dot.className = 'status-dot online';
+            txt.textContent = 'Ollama Connected';
+          } else {
+            dot.className = 'status-dot offline';
+            txt.textContent = 'Ollama Offline';
+          }
         }
       } catch (e) {
-        document.getElementById('sidebar-dot').className = 'status-dot offline';
-        document.getElementById('sidebar-status').textContent = 'Router Offline';
+        const dot = document.getElementById('sidebar-dot');
+        const txt = document.getElementById('sidebar-status');
+        if (dot) dot.className = 'status-dot offline';
+        if (txt) txt.textContent = 'Router Offline';
       }
     }
     updateHealth();
@@ -746,8 +771,10 @@ INDEX_HTML = """<!DOCTYPE html>
     // Chat Management
     function renderHistory() {
       const list = document.getElementById('history-list');
+      if (!list) return;
       list.innerHTML = '';
       chats.forEach((c) => {
+        if (!c) return;
         const item = document.createElement('div');
         item.className = 'history-item' + (c.id === currentChatId ? ' active' : '');
         item.innerHTML = `<span>💬 ${escapeHtml(c.title || 'Conversation')}</span><span class="del-chat" onclick="deleteChat(event, '${c.id}')">&times;</span>`;
@@ -765,22 +792,28 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function loadChat(id) {
       currentChatId = id;
-      const chat = chats.find(c => c.id === id);
+      const chat = chats.find(c => c && c.id === id);
+      if (!chatInner) return;
       chatInner.innerHTML = '';
-      if (!chat || chat.messages.length === 0) {
-        chatInner.appendChild(heroSection);
-        heroSection.style.display = 'flex';
+
+      if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) {
+        if (heroSection) {
+          chatInner.appendChild(heroSection);
+          heroSection.style.display = 'flex';
+        }
       } else {
-        heroSection.style.display = 'none';
-        chat.messages.forEach(m => renderMessageDOM(m));
+        if (heroSection) heroSection.style.display = 'none';
+        chat.messages.forEach(m => {
+          if (m && m.content) renderMessageDOM(m);
+        });
       }
       renderHistory();
-      chatScroll.scrollTop = chatScroll.scrollHeight;
+      if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
     }
 
     function deleteChat(e, id) {
-      e.stopPropagation();
-      chats = chats.filter(c => c.id !== id);
+      if (e) e.stopPropagation();
+      chats = chats.filter(c => c && c.id !== id);
       saveChats();
       if (currentChatId === id) {
         if (chats.length > 0) loadChat(chats[0].id);
@@ -791,10 +824,13 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function saveChats() {
-      localStorage.setItem('router_chats', JSON.stringify(chats));
+      try {
+        localStorage.setItem('router_chats', JSON.stringify(chats));
+      } catch (e) {}
     }
 
     function fillAndSend(text) {
+      if (!promptInput) return;
       promptInput.value = text;
       promptInput.dispatchEvent(new Event('input'));
       submitMessage();
@@ -802,6 +838,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // Send Message
     async function submitMessage() {
+      if (!promptInput) return;
       const prompt = promptInput.value.trim();
       if (!prompt) return;
 
@@ -810,22 +847,27 @@ INDEX_HTML = """<!DOCTYPE html>
         chats.unshift({ id: currentChatId, title: prompt.slice(0, 30), messages: [] });
       }
 
-      const chat = chats.find(c => c.id === currentChatId);
-      if (chat && chat.messages.length === 0) {
+      const chat = chats.find(c => c && c.id === currentChatId);
+      if (chat && (!chat.messages || chat.messages.length === 0)) {
         chat.title = prompt.slice(0, 30) + (prompt.length > 30 ? '...' : '');
       }
 
-      heroSection.style.display = 'none';
+      if (heroSection) heroSection.style.display = 'none';
 
       // 1. User Message
       const userMsg = { role: 'user', content: prompt };
-      chat.messages.push(userMsg);
+      if (chat) {
+        if (!chat.messages) chat.messages = [];
+        chat.messages.push(userMsg);
+      }
       renderMessageDOM(userMsg);
 
       promptInput.value = '';
       promptInput.style.height = '28px';
-      sendBtn.classList.remove('active');
-      sendBtn.disabled = true;
+      if (sendBtn) {
+        sendBtn.classList.remove('active');
+        sendBtn.disabled = true;
+      }
 
       // 2. Bot Placeholder
       const botMsgId = 'bot_' + Date.now();
@@ -839,14 +881,15 @@ INDEX_HTML = """<!DOCTYPE html>
           <div style="color: #888; font-style: italic;">Processing prompt on local Ollama...</div>
         </div>
       `;
-      chatInner.appendChild(placeholder);
-      chatScroll.scrollTop = chatScroll.scrollHeight;
+      if (chatInner) chatInner.appendChild(placeholder);
+      if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
 
       // 3. API Call with Streaming & Persona
-      const model = modelSelect.value;
-      const persona = document.getElementById('persona-select').value;
-      const contextLimit = parseInt(ctxSlider.value, 10);
-      const stripReasoning = stripChk.checked;
+      const model = modelSelect ? modelSelect.value : 'auto';
+      const personaEl = document.getElementById('persona-select');
+      const persona = personaEl ? personaEl.value : 'general';
+      const contextLimit = ctxSlider ? parseInt(ctxSlider.value, 10) : 2048;
+      const stripReasoning = stripChk ? stripChk.checked : true;
 
       try {
         const res = await fetch('/v1/chat', {
@@ -873,7 +916,7 @@ INDEX_HTML = """<!DOCTYPE html>
           }
           placeholder.remove();
           const errPayload = { role: 'bot', content: '❌ Error: ' + errorDetail };
-          chat.messages.push(errPayload);
+          if (chat) chat.messages.push(errPayload);
           renderMessageDOM(errPayload);
           return;
         }
@@ -917,13 +960,20 @@ INDEX_HTML = """<!DOCTYPE html>
                 // Render live typewriter
                 const cleanThink = thinkContent.replace(/<\/?think>/g, '').trim();
                 const thinkHtml = cleanThink ? `<details class="think-box" open><summary>🧠 Thinking Process...</summary><pre>${escapeHtml(cleanThink)}</pre></details>` : '';
-                const renderedMd = marked.parse(fullResponse || '');
-                botMsgContent.innerHTML = `
-                  <div class="bot-header-badge">⚡ ${escapeHtml(targetModel)} • ${escapeHtml(persona)}</div>
-                  ${thinkHtml}
-                  <div class="markdown-body">${renderedMd}</div>
-                `;
-                chatScroll.scrollTop = chatScroll.scrollHeight;
+                
+                let renderedMd = escapeHtml(fullResponse || '');
+                if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+                  try { renderedMd = marked.parse(fullResponse || ''); } catch (e) {}
+                }
+
+                if (botMsgContent) {
+                  botMsgContent.innerHTML = `
+                    <div class="bot-header-badge">⚡ ${escapeHtml(targetModel)} • ${escapeHtml(persona)}</div>
+                    ${thinkHtml}
+                    <div class="markdown-body">${renderedMd}</div>
+                  `;
+                }
+                if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
               }
             } catch (e) {}
           }
@@ -943,7 +993,7 @@ INDEX_HTML = """<!DOCTYPE html>
           reasoning: finalCleanReasoning,
           tokens: { eval_count: evalCount }
         };
-        chat.messages.push(botMsg);
+        if (chat) chat.messages.push(botMsg);
         renderMessageDOM(botMsg);
         saveChats();
         renderHistory();
@@ -951,17 +1001,21 @@ INDEX_HTML = """<!DOCTYPE html>
       } catch (err) {
         placeholder.remove();
         const errPayload = { role: 'bot', content: '❌ Network Error: ' + err.message };
-        chat.messages.push(errPayload);
+        if (chat) chat.messages.push(errPayload);
         renderMessageDOM(errPayload);
       } finally {
-        sendBtn.disabled = false;
-        promptInput.focus();
+        if (sendBtn) {
+          sendBtn.disabled = false;
+          sendBtn.classList.remove('active');
+        }
+        if (promptInput) promptInput.focus();
       }
     }
 
     function renderMessageDOM(msg) {
+      if (!chatInner || !msg) return;
       const row = document.createElement('div');
-      row.className = 'msg-row ' + msg.role;
+      row.className = 'msg-row ' + (msg.role || 'bot');
 
       if (msg.role === 'user') {
         row.innerHTML = `<div class="msg-user-bubble">${escapeHtml(msg.content)}</div>`;
@@ -977,8 +1031,15 @@ INDEX_HTML = """<!DOCTYPE html>
           thinkHtml = `<details class="think-box"><summary>🧠 View Thinking Process</summary><pre>${escapeHtml(msg.reasoning)}</pre></details>`;
         }
 
-        // Render Markdown
-        const renderedMd = marked.parse(msg.content || '');
+        // Render Markdown safely
+        let renderedMd = escapeHtml(msg.content || '');
+        if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+          try {
+            renderedMd = marked.parse(msg.content || '');
+          } catch (e) {
+            renderedMd = escapeHtml(msg.content || '');
+          }
+        }
 
         row.innerHTML = `
           <div class="avatar">✦</div>
@@ -989,20 +1050,24 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         `;
 
-        // Highlight code & inject copy buttons
-        row.querySelectorAll('pre code').forEach((block) => {
-          hljs.highlightElement(block);
-          const pre = block.parentElement;
-          const lang = block.className.replace('hljs language-', '').replace('hljs', '').trim() || 'code';
-          const header = document.createElement('div');
-          header.className = 'code-header';
-          header.innerHTML = `<span>${lang}</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button>`;
-          pre.insertBefore(header, block);
-        });
+        // Highlight code & inject copy buttons safely
+        if (typeof hljs !== 'undefined' && typeof hljs.highlightElement === 'function') {
+          row.querySelectorAll('pre code').forEach((block) => {
+            try {
+              hljs.highlightElement(block);
+              const pre = block.parentElement;
+              const lang = block.className.replace('hljs language-', '').replace('hljs', '').trim() || 'code';
+              const header = document.createElement('div');
+              header.className = 'code-header';
+              header.innerHTML = `<span>${lang}</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button>`;
+              pre.insertBefore(header, block);
+            } catch (e) {}
+          });
+        }
       }
 
       chatInner.appendChild(row);
-      chatScroll.scrollTop = chatScroll.scrollHeight;
+      if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
     }
 
     function copyCode(btn) {
@@ -1018,11 +1083,16 @@ INDEX_HTML = """<!DOCTYPE html>
       return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    // Initial load
-    if (chats.length === 0) {
+    // Initial load wrapped in safety catch
+    try {
+      if (chats.length === 0) {
+        startNewChat();
+      } else {
+        loadChat(chats[0].id);
+      }
+    } catch (e) {
+      console.warn("Recovered from stored chat parse error:", e);
       startNewChat();
-    } else {
-      loadChat(chats[0].id);
     }
   </script>
 </body>
