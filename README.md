@@ -53,7 +53,7 @@ ollama pull qwen2.5-coder:1.5b-base
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/<your-username>/ollama-model-router.git
+git clone https://github.com/ardy644/ollama-model-router.git
 cd ollama-model-router
 ```
 
@@ -236,7 +236,9 @@ ollama-model-router/
 ├── main.py              # FastAPI application (3 endpoints, router, think-tag processor)
 ├── test_client.py       # Standalone test client (3 test scenarios)
 ├── requirements.txt     # Python dependencies
-└── README.md            # This file
+├── .gitignore           # Git ignore rules
+├── LICENSE              # MIT License
+└── README.md            # Project documentation
 ```
 
 ---
