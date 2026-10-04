@@ -112,6 +112,24 @@ app = FastAPI(
 )
 
 
+# ---- GET / ----------------------------------------------------------------
+
+
+@app.get("/")
+async def root():
+    """Root landing endpoint providing service info and links."""
+    return {
+        "service": "Ollama Model Router",
+        "status": "online",
+        "docs": "/docs",
+        "endpoints": {
+            "health": "/health",
+            "models": "/v1/models",
+            "chat": "POST /v1/chat",
+        },
+    }
+
+
 # ---- POST /v1/chat -------------------------------------------------------
 
 
