@@ -6,17 +6,23 @@ Auto-routes prompts to the best model via keyword heuristics,
 enforces VRAM-safe context limits, and strips DeepSeek <think> tags.
 """
 
+import asyncio
 import json
+import logging
+import os
 import re
+import shutil
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal, Optional
+from pathlib import Path
+from typing import AsyncIterator, Literal, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -27,14 +33,13 @@ OLLAMA_GENERATE = f"{OLLAMA_BASE}/api/generate"
 OLLAMA_CHAT = f"{OLLAMA_BASE}/api/chat"
 OLLAMA_TIMEOUT = 120.0  # seconds
 
-ALLOWED_MODELS = [
-    "auto",
+DEFAULT_MODEL_CHOICES = [
     "gemma3:1b",
     "qwen2.5:3b",
     "deepseek-r1:1.5b",
     "qwen2.5-coder:1.5b-base",
 ]
-INSTALLED_MODELS = ALLOWED_MODELS[1:]  # everything except "auto"
+SETTINGS_PATH = Path(__file__).with_name("router_settings.json")
 
 # ---------------------------------------------------------------------------
 # Persona & System Prompt Presets
@@ -76,22 +81,6 @@ PERSONAS = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# Regex patterns for auto-routing
-# ---------------------------------------------------------------------------
-
-CODING_PATTERN = re.compile(
-    r"\b(python|code|function|def|class|sql|bug|script|html|css|javascript|"
-    r"typescript|api|endpoint|variable|loop|array|compile|debug|refactor|git|regex)\b",
-    re.IGNORECASE,
-)
-
-REASONING_PATTERN = re.compile(
-    r"\b(solve|calculate|why|step[- ]by[- ]step|logic|evaluate|proof|theorem|"
-    r"math|equation|reason|derive|deduce|explain\s+why|analyze)\b",
-    re.IGNORECASE,
-)
-
 # Pattern to extract <think>...</think> blocks from deepseek-r1 output
 THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
@@ -100,18 +89,18 @@ THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # ---------------------------------------------------------------------------
 
 
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatRequest(BaseModel):
     prompt: str
-    model: Literal[
-        "auto",
-        "gemma3:1b",
-        "qwen2.5:3b",
-        "deepseek-r1:1.5b",
-        "qwen2.5-coder:1.5b-base",
-    ] = "auto"
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=12)
+    model: str = "auto"
     persona: Optional[Literal["general", "coder", "reasoner", "executive", "custom"]] = "general"
     system_prompt: Optional[str] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     stream: bool = False
     strip_reasoning: bool = True
     context_limit: int = Field(default=2048, ge=512, le=4096)
@@ -124,18 +113,86 @@ class ChatRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: str
+    role: Literal["system", "user", "assistant"]
     content: str
 
 
 class OpenAIChatCompletionRequest(BaseModel):
     model: Optional[str] = "auto"
     messages: list[ChatMessage]
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=4096)
     stream: Optional[bool] = False
     context_limit: Optional[int] = Field(default=2048, ge=512, le=4096)
     persona: Optional[str] = "general"
+
+
+class RouterSettings(BaseModel):
+    model_choices: list[str] = Field(default_factory=lambda: list(DEFAULT_MODEL_CHOICES), min_length=1, max_length=40)
+    coding_model: str = "qwen2.5-coder:1.5b-base"
+    reasoning_model: str = "deepseek-r1:1.5b"
+    fallback_model: str = "gemma3:1b"
+    coding_keywords: list[str] = Field(default_factory=lambda: [
+        "python", "code", "function", "def", "class", "sql", "bug", "script", "html", "css",
+        "javascript", "typescript", "api", "endpoint", "variable", "loop", "array", "compile",
+        "debug", "refactor", "git", "regex",
+    ], min_length=1, max_length=100)
+    reasoning_keywords: list[str] = Field(default_factory=lambda: [
+        "solve", "calculate", "why", "step-by-step", "step by step", "logic", "evaluate", "proof",
+        "theorem", "math", "equation", "reason", "derive", "deduce", "explain why", "analyze",
+    ], min_length=1, max_length=100)
+
+    @field_validator("model_choices")
+    @classmethod
+    def validate_model_choices(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if not cleaned or "auto" in cleaned or any(
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", value)
+            for value in cleaned
+        ):
+            raise ValueError("Model choices must be valid Ollama model tags")
+        return cleaned
+
+    @field_validator("coding_keywords", "reasoning_keywords")
+    @classmethod
+    def validate_keywords(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(value.strip().lower() for value in values if value.strip()))
+        if not cleaned or any(len(value) > 60 for value in cleaned):
+            raise ValueError("Keyword lists must contain non-empty terms of at most 60 characters")
+        return cleaned
+
+    @field_validator("coding_model", "reasoning_model", "fallback_model")
+    @classmethod
+    def validate_routing_model_tags(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", value):
+            raise ValueError("Routing model must be a valid Ollama model tag")
+        return value
+
+    @model_validator(mode="after")
+    def validate_routing_models_are_choices(self):
+        missing = {self.coding_model, self.reasoning_model, self.fallback_model} - set(self.model_choices)
+        if missing:
+            raise ValueError(f"Routing models must be included in model_choices: {sorted(missing)}")
+        return self
+
+
+def load_router_settings() -> RouterSettings:
+    try:
+        if SETTINGS_PATH.exists():
+            return RouterSettings.model_validate_json(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logging.getLogger(__name__).exception("Could not load router settings; using defaults")
+    return RouterSettings()
+
+
+def save_router_settings(settings: RouterSettings) -> None:
+    temporary_path = SETTINGS_PATH.with_suffix(".tmp")
+    temporary_path.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
+    temporary_path.replace(SETTINGS_PATH)
+
+
+ROUTER_SETTINGS = load_router_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -144,15 +201,43 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 
 def classify_prompt(prompt: str) -> str:
-    """Route a prompt to the best model using keyword heuristics.
+    """Route with current settings. Coding rules take priority over reasoning."""
+    coding_pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.coding_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    reasoning_pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.reasoning_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    if coding_pattern.search(prompt):
+        return ROUTER_SETTINGS.coding_model
+    if reasoning_pattern.search(prompt):
+        return ROUTER_SETTINGS.reasoning_model
+    return ROUTER_SETTINGS.fallback_model
 
-    Priority: Coding → Reasoning → Ultra-fast fallback (gemma3:1b).
-    """
-    if CODING_PATTERN.search(prompt):
-        return "qwen2.5-coder:1.5b-base"
-    if REASONING_PATTERN.search(prompt):
-        return "deepseek-r1:1.5b"
-    return "gemma3:1b"
+
+def format_prompt_with_history(
+    prompt: str, history: list[ChatHistoryMessage], max_history_chars: int = 6000
+) -> str:
+    """Add recent chat turns while keeping the extra prompt within a small bound."""
+    recent = []
+    remaining = max_history_chars
+    for message in reversed(history):
+        content = message.content.strip()
+        if not content or remaining <= 0:
+            continue
+        content = content[-remaining:]
+        recent.append((message.role, content))
+        remaining -= len(content)
+    recent.reverse()
+    if not recent:
+        return prompt
+    transcript = "\n".join(
+        f"{'User' if role == 'user' else 'Assistant'}: {content}"
+        for role, content in recent
+    )
+    return f"Previous conversation:\n{transcript}\nUser: {prompt}"
 
 
 def process_reasoning(
@@ -176,6 +261,55 @@ def process_reasoning(
 # ---------------------------------------------------------------------------
 
 
+async def ollama_is_reachable(client: httpx.AsyncClient) -> bool:
+    try:
+        response = await client.get(f"{OLLAMA_BASE}/", timeout=1.0)
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def start_ollama_if_needed(app: FastAPI, client: httpx.AsyncClient) -> None:
+    if await ollama_is_reachable(client):
+        return
+    executable = shutil.which("ollama")
+    if not executable and os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidate = Path(local_app_data) / "Programs" / "Ollama" / "ollama.exe"
+            if candidate.is_file():
+                executable = str(candidate)
+    if not executable:
+        logging.getLogger(__name__).warning(
+            "Ollama is not running and its CLI was not found; start Ollama manually."
+        )
+        return
+    try:
+        process_options: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            process_options["start_new_session"] = True
+        app.state.ollama_process = subprocess.Popen(
+            [executable, "serve"], **process_options
+        )
+        logging.getLogger(__name__).info("Started Ollama server automatically.")
+        for _ in range(20):
+            if await ollama_is_reachable(client):
+                return
+            await asyncio.sleep(0.5)
+        logging.getLogger(__name__).warning(
+            "Ollama was launched but did not become available within 10 seconds."
+        )
+    except OSError:
+        logging.getLogger(__name__).exception("Could not start Ollama automatically")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage lifecycle of shared HTTP client with connection pooling."""
@@ -195,17 +329,20 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = client
     try:
+        await start_ollama_if_needed(app, client)
         yield
     finally:
         await client.aclose()
 
 
-def get_http_client(request: Request) -> httpx.AsyncClient:
+async def get_http_client(request: Request) -> AsyncIterator[httpx.AsyncClient]:
     """Dependency provider for shared HTTPX async client."""
     client: Optional[httpx.AsyncClient] = getattr(request.app.state, "http_client", None)
-    if client is None or client.is_closed:
-        return httpx.AsyncClient(timeout=OLLAMA_TIMEOUT)
-    return client
+    if client is not None and not client.is_closed:
+        yield client
+        return
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as fallback_client:
+        yield fallback_client
 
 
 app = FastAPI(
@@ -219,12 +356,15 @@ app = FastAPI(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global safety net returning structured JSON on any unexpected error."""
+    """Log unexpected errors while returning a generic response to clients."""
+    logging.getLogger(__name__).error(
+        "Unhandled error while processing %s", request.url.path, exc_info=exc
+    )
     return JSONResponse(
         status_code=500,
         content={
             "error": "InternalServerError",
-            "detail": str(exc),
+            "detail": "An unexpected error occurred.",
             "path": request.url.path,
         },
     )
@@ -622,7 +762,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
       border-radius: 16px;
       width: 90%;
-      max-width: 440px;
+      max-width: 560px;
+      max-height: 85vh;
+      overflow-y: auto;
       padding: 22px;
       box-shadow: 0 10px 30px rgba(0,0,0,0.5);
     }
@@ -632,6 +774,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .setting-label { font-size: 0.88rem; font-weight: 500; margin-bottom: 6px; display: flex; justify-content: space-between; }
     .setting-desc { font-size: 0.75rem; color: #999; margin-top: 4px; }
     input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .advanced-panel { display: none; border-top: 1px solid var(--border-color); padding-top: 16px; margin-top: 4px; }
+    .advanced-panel.open { display: block; }
+    .setting-textarea {
+      width: 100%; min-height: 110px; resize: vertical; box-sizing: border-box;
+      background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px;
+      color: var(--text-main); padding: 10px; font: inherit; font-size: 0.84rem;
+    }
+    .setting-input, .setting-select {
+      width: 100%; box-sizing: border-box; background: var(--bg-input);
+      border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-main);
+      padding: 9px 10px; font: inherit; font-size: 0.84rem;
+    }
+    .save-settings-btn {
+      border: 0; border-radius: 8px; padding: 9px 14px; color: white;
+      background: var(--accent); cursor: pointer; font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -739,6 +897,36 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button class="modal-close" onclick="closeSettings()">&times;</button>
       </div>
       <div class="setting-row">
+        <div class="setting-label">Routing rules and models</div>
+        <label class="setting-desc" for="model-choices-input">Model choices (comma separated)</label>
+        <input class="setting-input" id="model-choices-input" type="text" maxlength="3000" placeholder="gemma3:1b, qwen2.5:3b">
+        <div class="setting-desc">Use model tags available in Ollama. Each routing model must be in this list.</div>
+      </div>
+      <div class="setting-row">
+        <label class="setting-label" for="coding-model-select">Model for coding prompts</label>
+        <select class="setting-select" id="coding-model-select"></select>
+      </div>
+      <div class="setting-row">
+        <label class="setting-label" for="reasoning-model-select">Model for reasoning prompts</label>
+        <select class="setting-select" id="reasoning-model-select"></select>
+      </div>
+      <div class="setting-row">
+        <label class="setting-label" for="fallback-model-select">Model for other prompts</label>
+        <select class="setting-select" id="fallback-model-select"></select>
+      </div>
+      <div class="setting-row">
+        <label class="setting-label" for="coding-keywords-input">Coding keywords (comma separated)</label>
+        <textarea class="setting-textarea" id="coding-keywords-input" maxlength="6000" rows="3"></textarea>
+      </div>
+      <div class="setting-row">
+        <label class="setting-label" for="reasoning-keywords-input">Reasoning keywords (comma separated)</label>
+        <textarea class="setting-textarea" id="reasoning-keywords-input" maxlength="6000" rows="3"></textarea>
+      </div>
+      <div class="setting-row">
+        <button class="save-settings-btn" id="save-routing-settings">Save routing settings</button>
+        <span class="setting-desc" id="routing-settings-status" role="status" aria-live="polite"></span>
+      </div>
+      <div class="setting-row">
         <div class="setting-label">
           <span>Context Window (num_ctx)</span>
           <span id="modal-ctx-val" style="font-family: monospace; color: #79c0ff;">2048</span>
@@ -752,6 +940,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="setting-desc">Strips &lt;think&gt; tags from DeepSeek into a collapsible drawer.</div>
         </div>
         <input type="checkbox" id="modal-strip-chk" checked style="accent-color: var(--accent); width: 18px; height: 18px;">
+      </div>
+      <div class="setting-row" style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <div class="setting-label" style="margin-bottom: 2px;">Advanced customization</div>
+          <div class="setting-desc">Set custom instructions and response creativity.</div>
+        </div>
+        <input type="checkbox" id="advanced-mode-chk" style="accent-color: var(--accent); width: 18px; height: 18px;">
+      </div>
+      <div class="advanced-panel" id="advanced-panel">
+        <div class="setting-row">
+          <div class="setting-label"><label for="custom-system-prompt">Custom instructions</label></div>
+          <textarea class="setting-textarea" id="custom-system-prompt" maxlength="8000" placeholder="Example: Answer in plain language and include one practical example."></textarea>
+          <div class="setting-desc">These instructions take priority over the selected persona.</div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="temperature-slider">Creativity (temperature)</label>
+            <span id="temperature-value" style="font-family: monospace; color: #79c0ff;">0.7</span>
+          </div>
+          <input type="range" id="temperature-slider" min="0" max="2" step="0.1" value="0.7">
+          <div class="setting-desc">Lower values are more consistent; higher values are more varied.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -784,6 +994,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
     const ctxSlider = document.getElementById('modal-ctx-slider');
     const ctxVal = document.getElementById('modal-ctx-val');
     const stripChk = document.getElementById('modal-strip-chk');
+    const advancedModeChk = document.getElementById('advanced-mode-chk');
+    const advancedPanel = document.getElementById('advanced-panel');
+    const customSystemPrompt = document.getElementById('custom-system-prompt');
+    const temperatureSlider = document.getElementById('temperature-slider');
+    const temperatureValue = document.getElementById('temperature-value');
+    const modelChoicesInput = document.getElementById('model-choices-input');
+    const codingModelSelect = document.getElementById('coding-model-select');
+    const reasoningModelSelect = document.getElementById('reasoning-model-select');
+    const fallbackModelSelect = document.getElementById('fallback-model-select');
+    const codingKeywordsInput = document.getElementById('coding-keywords-input');
+    const reasoningKeywordsInput = document.getElementById('reasoning-keywords-input');
+    const saveRoutingSettingsButton = document.getElementById('save-routing-settings');
+    const routingSettingsStatus = document.getElementById('routing-settings-status');
+
+    try {
+      const savedAdvanced = localStorage.getItem('router_advanced_mode') === 'true';
+      if (advancedModeChk) advancedModeChk.checked = savedAdvanced;
+      if (advancedPanel) advancedPanel.classList.toggle('open', savedAdvanced);
+      const savedSystemPrompt = localStorage.getItem('router_custom_system_prompt');
+      if (savedSystemPrompt && customSystemPrompt) customSystemPrompt.value = savedSystemPrompt;
+      const savedTemperature = localStorage.getItem('router_temperature');
+      if (savedTemperature && temperatureSlider) temperatureSlider.value = savedTemperature;
+      if (temperatureValue && temperatureSlider) temperatureValue.textContent = Number(temperatureSlider.value).toFixed(1);
+    } catch (e) {}
 
     // 1. Attach Event Listeners FIRST so input is always responsive
     if (promptInput) {
@@ -815,6 +1049,112 @@ INDEX_HTML = r"""<!DOCTYPE html>
     if (ctxSlider && ctxVal) {
       ctxSlider.addEventListener('input', (e) => {
         ctxVal.textContent = e.target.value;
+      });
+    }
+
+    if (advancedModeChk && advancedPanel) {
+      advancedModeChk.addEventListener('change', () => {
+        advancedPanel.classList.toggle('open', advancedModeChk.checked);
+        try { localStorage.setItem('router_advanced_mode', String(advancedModeChk.checked)); } catch (e) {}
+      });
+    }
+    if (customSystemPrompt) {
+      customSystemPrompt.addEventListener('input', () => {
+        try { localStorage.setItem('router_custom_system_prompt', customSystemPrompt.value); } catch (e) {}
+      });
+    }
+    if (temperatureSlider && temperatureValue) {
+      temperatureSlider.addEventListener('input', () => {
+        temperatureValue.textContent = Number(temperatureSlider.value).toFixed(1);
+        try { localStorage.setItem('router_temperature', temperatureSlider.value); } catch (e) {}
+      });
+    }
+
+    function parseCommaList(value) {
+      return String(value || '').split(',').map(item => item.trim()).filter(Boolean);
+    }
+    function populateSelect(select, values, selectedValue, includeAuto = false) {
+      if (!select) return;
+      select.textContent = '';
+      if (includeAuto) {
+        const autoOption = document.createElement('option');
+        autoOption.value = 'auto';
+        autoOption.textContent = '✨ Auto Router';
+        select.appendChild(autoOption);
+      }
+      values.forEach(value => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        select.appendChild(option);
+      });
+      if (values.includes(selectedValue) || (includeAuto && selectedValue === 'auto')) {
+        select.value = selectedValue;
+      } else if (includeAuto) {
+        select.value = 'auto';
+      } else if (values.length) {
+        select.value = values[0];
+      }
+    }
+    function applyRouterSettings(settings) {
+      const models = settings.model_choices || [];
+      populateSelect(modelSelect, models, modelSelect ? modelSelect.value : 'auto', true);
+      populateSelect(codingModelSelect, models, settings.coding_model);
+      populateSelect(reasoningModelSelect, models, settings.reasoning_model);
+      populateSelect(fallbackModelSelect, models, settings.fallback_model);
+      if (modelChoicesInput) modelChoicesInput.value = models.join(', ');
+      if (codingKeywordsInput) codingKeywordsInput.value = (settings.coding_keywords || []).join(', ');
+      if (reasoningKeywordsInput) reasoningKeywordsInput.value = (settings.reasoning_keywords || []).join(', ');
+    }
+    async function loadRouterSettings() {
+      try {
+        const response = await fetch('/v1/settings');
+        if (!response.ok) throw new Error('Could not load routing settings');
+        applyRouterSettings(await response.json());
+      } catch (error) {
+        if (routingSettingsStatus) routingSettingsStatus.textContent = 'Could not load routing settings.';
+      }
+    }
+    if (modelChoicesInput) {
+      modelChoicesInput.addEventListener('input', () => {
+        const models = parseCommaList(modelChoicesInput.value);
+        populateSelect(codingModelSelect, models, codingModelSelect.value);
+        populateSelect(reasoningModelSelect, models, reasoningModelSelect.value);
+        populateSelect(fallbackModelSelect, models, fallbackModelSelect.value);
+      });
+    }
+    if (saveRoutingSettingsButton) {
+      saveRoutingSettingsButton.addEventListener('click', async () => {
+        const settings = {
+          model_choices: parseCommaList(modelChoicesInput ? modelChoicesInput.value : ''),
+          coding_model: codingModelSelect ? codingModelSelect.value : '',
+          reasoning_model: reasoningModelSelect ? reasoningModelSelect.value : '',
+          fallback_model: fallbackModelSelect ? fallbackModelSelect.value : '',
+          coding_keywords: parseCommaList(codingKeywordsInput ? codingKeywordsInput.value : ''),
+          reasoning_keywords: parseCommaList(reasoningKeywordsInput ? reasoningKeywordsInput.value : '')
+        };
+        saveRoutingSettingsButton.disabled = true;
+        if (routingSettingsStatus) routingSettingsStatus.textContent = 'Saving…';
+        try {
+          const response = await fetch('/v1/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings)
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            const detail = Array.isArray(result.detail)
+              ? result.detail.map(error => error.msg).join(', ')
+              : (result.detail || 'Could not save settings');
+            throw new Error(detail);
+          }
+          applyRouterSettings(result);
+          if (routingSettingsStatus) routingSettingsStatus.textContent = 'Saved.';
+        } catch (error) {
+          if (routingSettingsStatus) routingSettingsStatus.textContent = error.message;
+        } finally {
+          saveRoutingSettingsButton.disabled = false;
+        }
       });
     }
 
@@ -855,6 +1195,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         if (txt) txt.textContent = 'Router Offline';
       }
     }
+    loadRouterSettings();
     updateHealth();
     setInterval(updateHealth, 10000);
 
@@ -867,7 +1208,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
         if (!c) return;
         const item = document.createElement('div');
         item.className = 'history-item' + (c.id === currentChatId ? ' active' : '');
-        item.innerHTML = `<span>💬 ${escapeHtml(c.title || 'Conversation')}</span><span class="del-chat" onclick="deleteChat(event, '${c.id}')">&times;</span>`;
+        item.innerHTML = `<span>💬 ${escapeHtml(c.title || 'Conversation')}</span>`;
+        const deleteButton = document.createElement('span');
+        deleteButton.className = 'del-chat';
+        deleteButton.textContent = '×';
+        deleteButton.addEventListener('click', (event) => deleteChat(event, c.id));
+        item.appendChild(deleteButton);
         item.onclick = () => loadChat(c.id);
         list.appendChild(item);
       });
@@ -969,6 +1315,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if (chat && (!chat.messages || chat.messages.length === 0)) {
         chat.title = prompt.slice(0, 30) + (prompt.length > 30 ? '...' : '');
       }
+      const history = (chat && Array.isArray(chat.messages) ? chat.messages : [])
+        .filter(message => message && (message.role === 'user' || message.role === 'bot') && message.content)
+        .slice(-12)
+        .map(message => ({
+          role: message.role === 'user' ? 'user' : 'assistant',
+          content: message.content
+        }));
 
       if (heroSection) heroSection.style.display = 'none';
 
@@ -1008,6 +1361,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const persona = personaEl ? personaEl.value : 'general';
       const contextLimit = ctxSlider ? parseInt(ctxSlider.value, 10) : 2048;
       const stripReasoning = stripChk ? stripChk.checked : true;
+      const advancedMode = advancedModeChk ? advancedModeChk.checked : false;
 
       stopGenerating();
       streamAbortController = new AbortController();
@@ -1020,10 +1374,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
           signal: streamAbortController.signal,
           body: JSON.stringify({
             prompt: prompt,
+            history: history,
             model: model,
             persona: persona,
             context_limit: contextLimit,
             strip_reasoning: stripReasoning,
+            ...(advancedMode ? {
+              system_prompt: customSystemPrompt ? customSystemPrompt.value.trim() : '',
+              temperature: temperatureSlider ? Number(temperatureSlider.value) : 0.7
+            } : {}),
             stream: true
           })
         });
@@ -1084,10 +1443,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const cleanThink = thinkContent.replace(/<\/?think>/g, '').trim();
                 const thinkHtml = cleanThink ? `<details class="think-box" open><summary>🧠 Thinking Process...</summary><pre>${escapeHtml(cleanThink)}</pre></details>` : '';
                 
-                let renderedMd = escapeHtml(fullResponse || '');
-                if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
-                  try { renderedMd = marked.parse(fullResponse || ''); } catch (e) {}
-                }
+                const renderedMd = renderMarkdownSafe(fullResponse || '');
 
                 if (botMsgContent) {
                   botMsgContent.innerHTML = `
@@ -1169,7 +1525,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       } else {
         let metaBadge = '';
         if (msg.model) {
-          const tokenStr = msg.tokens && msg.tokens.eval_count ? ` • ${msg.tokens.eval_count} tokens` : '';
+          const tokenStr = msg.tokens && msg.tokens.eval_count ? ` • ${escapeHtml(msg.tokens.eval_count)} tokens` : '';
           metaBadge = `<div class="bot-header-badge">⚡ ${escapeHtml(msg.model)}${tokenStr}</div>`;
         }
 
@@ -1178,15 +1534,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           thinkHtml = `<details class="think-box"><summary>🧠 View Thinking Process</summary><pre>${escapeHtml(msg.reasoning)}</pre></details>`;
         }
 
-        // Render Markdown safely
-        let renderedMd = escapeHtml(msg.content || '');
-        if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
-          try {
-            renderedMd = marked.parse(msg.content || '');
-          } catch (e) {
-            renderedMd = escapeHtml(msg.content || '');
-          }
-        }
+        const renderedMd = renderMarkdownSafe(msg.content || '');
 
         row.innerHTML = `
           <div class="avatar">✦</div>
@@ -1228,6 +1576,59 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     function escapeHtml(str) {
       return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function renderMarkdownSafe(source) {
+      if (typeof marked === 'undefined' || typeof marked.parse !== 'function') {
+        return escapeHtml(source);
+      }
+      try {
+        const parsed = new DOMParser().parseFromString(marked.parse(source), 'text/html');
+        const allowedTags = new Set([
+          'p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote',
+          'ul', 'ol', 'li', 'strong', 'em', 'del', 'a', 'code', 'pre',
+          'table', 'thead', 'tbody', 'tr', 'th', 'td'
+        ]);
+        const dropTags = new Set(['script', 'style', 'iframe', 'object', 'embed', 'svg', 'math', 'form']);
+        const safeUrl = (value) => {
+          try {
+            const url = new URL(value, window.location.href);
+            return ['http:', 'https:', 'mailto:'].includes(url.protocol) ? value : null;
+          } catch (e) { return null; }
+        };
+        const cleanNode = (node) => {
+          if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.nodeValue || '');
+          if (node.nodeType !== Node.ELEMENT_NODE) return document.createDocumentFragment();
+          const tag = node.tagName.toLowerCase();
+          if (dropTags.has(tag)) return document.createDocumentFragment();
+          if (!allowedTags.has(tag)) {
+            const fragment = document.createDocumentFragment();
+            Array.from(node.childNodes).forEach(child => fragment.appendChild(cleanNode(child)));
+            return fragment;
+          }
+          const clean = document.createElement(tag);
+          if (tag === 'a') {
+            const href = node.getAttribute('href');
+            const safeHref = href ? safeUrl(href) : null;
+            if (safeHref) clean.setAttribute('href', safeHref);
+            const title = node.getAttribute('title');
+            if (title) clean.setAttribute('title', title);
+          }
+          if (tag === 'code' || tag === 'th' || tag === 'td') {
+            const className = node.getAttribute('class') || '';
+            if (/^(language-[a-zA-Z0-9_+-]+|hljs)(\s+(language-[a-zA-Z0-9_+-]+|hljs))*$/.test(className)) {
+              clean.setAttribute('class', className);
+            }
+          }
+          Array.from(node.childNodes).forEach(child => clean.appendChild(cleanNode(child)));
+          return clean;
+        };
+        const safeRoot = document.createElement('div');
+        Array.from(parsed.body.childNodes).forEach(node => safeRoot.appendChild(cleanNode(node)));
+        return safeRoot.innerHTML;
+      } catch (e) {
+        return escapeHtml(source);
+      }
     }
 
     // Initial load wrapped in safety catch
@@ -1356,11 +1757,11 @@ async def chat(
     if request.model == "auto":
         target_model = classify_prompt(request.prompt)
     else:
-        if request.model not in INSTALLED_MODELS:
+        if request.model not in ROUTER_SETTINGS.model_choices:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown model: {request.model}. "
-                f"Available: {INSTALLED_MODELS}",
+                f"Available: {ROUTER_SETTINGS.model_choices}",
             )
         target_model = request.model
 
@@ -1378,7 +1779,7 @@ async def chat(
 
     payload = {
         "model": target_model,
-        "prompt": request.prompt,
+        "prompt": format_prompt_with_history(request.prompt, request.history),
         "stream": request.stream,
         "options": options,
     }
@@ -1469,10 +1870,13 @@ async def chat_completions(
     # Determine target model (auto-route using the last user prompt if auto)
     if not request.model or request.model == "auto":
         target_model = classify_prompt(last_user_prompt)
-    elif request.model in INSTALLED_MODELS:
+    elif request.model in ROUTER_SETTINGS.model_choices:
         target_model = request.model
     else:
-        target_model = "gemma3:1b"  # fallback
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model: {request.model}. Available: {ROUTER_SETTINGS.model_choices} or 'auto'.",
+        )
 
     # Resolve persona
     persona_system, persona_temp = resolve_persona_config(
@@ -1481,6 +1885,8 @@ async def chat_completions(
 
     full_prompt = "\n".join(conversation_lines)
     options: dict = {"num_ctx": request.context_limit or 2048}
+    if request.max_tokens is not None:
+        options["num_predict"] = request.max_tokens
     if persona_temp is not None:
         options["temperature"] = persona_temp
     if target_model == "qwen2.5:3b":
@@ -1559,27 +1965,43 @@ async def list_personas():
     return {"personas": PERSONAS}
 
 
+# ---- GET/PUT /v1/settings -----------------------------------------------
+
+
+@app.get("/v1/settings")
+async def get_router_settings():
+    """Return editable local routing rules and configured model tags."""
+    return ROUTER_SETTINGS.model_dump()
+
+
+@app.put("/v1/settings")
+async def update_router_settings(settings: RouterSettings):
+    """Validate and persist routing rules and model choices."""
+    global ROUTER_SETTINGS
+    try:
+        save_router_settings(settings)
+    except OSError:
+        logging.getLogger(__name__).exception("Could not save router settings")
+        raise HTTPException(status_code=500, detail="Could not save router settings")
+    ROUTER_SETTINGS = settings
+    return ROUTER_SETTINGS.model_dump()
+
+
 # ---- GET /v1/models ------------------------------------------------------
 
 
 @app.get("/v1/models")
 async def list_models():
-    """Return the list of installed models and auto-routing rules."""
+    """Return configured models and the active auto-routing rules."""
     return {
-        "installed_models": INSTALLED_MODELS,
-        "routing_options": ALLOWED_MODELS,
+        "installed_models": ROUTER_SETTINGS.model_choices,
+        "routing_options": ["auto", *ROUTER_SETTINGS.model_choices],
         "auto_routing_rules": {
-            "coding_keywords": (
-                "python, code, function, def, class, sql, bug, script, "
-                "html, css, javascript, typescript, api, endpoint, variable, "
-                "loop, array, compile, debug, refactor, git, regex"
-            ),
-            "reasoning_keywords": (
-                "solve, calculate, why, step-by-step, logic, evaluate, "
-                "proof, theorem, math, equation, reason, derive, deduce, "
-                "explain why, analyze"
-            ),
-            "default_fallback": "gemma3:1b",
+            "coding_keywords": ", ".join(ROUTER_SETTINGS.coding_keywords),
+            "reasoning_keywords": ", ".join(ROUTER_SETTINGS.reasoning_keywords),
+            "coding_model": ROUTER_SETTINGS.coding_model,
+            "reasoning_model": ROUTER_SETTINGS.reasoning_model,
+            "default_fallback": ROUTER_SETTINGS.fallback_model,
         },
     }
 
@@ -1596,4 +2018,10 @@ async def health(client: httpx.AsyncClient = Depends(get_http_client)):
         ollama_ok = resp.status_code == 200
     except Exception:
         pass
-    return {"status": "healthy", "ollama_connected": ollama_ok}
+    return JSONResponse(
+        status_code=200 if ollama_ok else 503,
+        content={
+            "status": "healthy" if ollama_ok else "unhealthy",
+            "ollama_connected": ollama_ok,
+        },
+    )

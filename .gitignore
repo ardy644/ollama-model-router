@@ -26,3 +26,5 @@ desktop.ini
 
 # Logs
 *.log
+router_settings.json
+router_settings.tmp

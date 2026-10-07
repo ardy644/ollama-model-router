@@ -112,6 +112,24 @@ def test_personas_endpoint():
     print("  ✅ PASSED — personas configured and accessible")
 
 
+def test_editable_routing_settings():
+    separator("Test 5: Editable Routing Settings")
+    original_response = httpx.get(f"{BASE_URL}/v1/settings", timeout=10.0)
+    assert original_response.status_code == 200
+    original = original_response.json()
+    changed = {**original, "coding_keywords": ["widgetforge"], "coding_model": "gemma3:1b"}
+    try:
+        response = httpx.put(f"{BASE_URL}/v1/settings", json=changed, timeout=10.0)
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        data = httpx.get(f"{BASE_URL}/v1/models", timeout=10.0).json()
+        assert data["auto_routing_rules"]["coding_keywords"] == "widgetforge"
+        assert data["auto_routing_rules"]["coding_model"] == "gemma3:1b"
+        print("  ✅ PASSED — routing keywords and model mappings can be changed")
+    finally:
+        restored = httpx.put(f"{BASE_URL}/v1/settings", json=original, timeout=10.0)
+        assert restored.status_code == 200, f"Could not restore routing settings: {restored.text}"
+
+
 def test_openai_chat_completions():
     separator("Test 5: OpenAI-Compatible /v1/chat/completions")
     payload = {
@@ -240,6 +258,7 @@ if __name__ == "__main__":
     try:
         # Happy Path Tests
         test_personas_endpoint()
+        test_editable_routing_settings()
         test_auto_code_routing()
         test_auto_reasoning_routing()
         test_manual_model_override()
@@ -258,4 +277,4 @@ if __name__ == "__main__":
         print(f"\n❌ FAILED — {e}")
         sys.exit(1)
 
-    print("\n🎉 All 9 tests passed (5 Happy Path + 4 Negative/Edge Case)!")
+    print("\n🎉 All 10 tests passed (6 Happy Path + 4 Negative/Edge Case)!")
