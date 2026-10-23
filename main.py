@@ -186,6 +186,21 @@ def load_router_settings() -> RouterSettings:
     return RouterSettings()
 
 
+_CODING_PATTERN: Optional[re.Pattern] = None
+_REASONING_PATTERN: Optional[re.Pattern] = None
+
+def _compile_patterns() -> None:
+    global _CODING_PATTERN, _REASONING_PATTERN
+    _CODING_PATTERN = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.coding_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    _REASONING_PATTERN = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.reasoning_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+
+
 def save_router_settings(settings: RouterSettings) -> None:
     temporary_path = SETTINGS_PATH.with_suffix(".tmp")
     temporary_path.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
@@ -193,6 +208,7 @@ def save_router_settings(settings: RouterSettings) -> None:
 
 
 ROUTER_SETTINGS = load_router_settings()
+_compile_patterns()
 
 
 # ---------------------------------------------------------------------------
@@ -202,17 +218,9 @@ ROUTER_SETTINGS = load_router_settings()
 
 def classify_prompt(prompt: str) -> str:
     """Route with current settings. Coding rules take priority over reasoning."""
-    coding_pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.coding_keywords) + r")(?!\w)",
-        re.IGNORECASE,
-    )
-    reasoning_pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.reasoning_keywords) + r")(?!\w)",
-        re.IGNORECASE,
-    )
-    if coding_pattern.search(prompt):
+    if _CODING_PATTERN and _CODING_PATTERN.search(prompt):
         return ROUTER_SETTINGS.coding_model
-    if reasoning_pattern.search(prompt):
+    if _REASONING_PATTERN and _REASONING_PATTERN.search(prompt):
         return ROUTER_SETTINGS.reasoning_model
     return ROUTER_SETTINGS.fallback_model
 
@@ -333,6 +341,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await client.aclose()
+        ollama_process = getattr(app.state, "ollama_process", None)
+        if ollama_process is not None:
+            logging.getLogger(__name__).info("Stopping automatically started Ollama server.")
+            ollama_process.terminate()
+            try:
+                ollama_process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                ollama_process.kill()
 
 
 async def get_http_client(request: Request) -> AsyncIterator[httpx.AsyncClient]:
@@ -357,6 +373,12 @@ app = FastAPI(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Log unexpected errors while returning a generic response to clients."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+        )
+
     logging.getLogger(__name__).error(
         "Unhandled error while processing %s", request.url.path, exc_info=exc
     )
@@ -1979,11 +2001,12 @@ async def update_router_settings(settings: RouterSettings):
     """Validate and persist routing rules and model choices."""
     global ROUTER_SETTINGS
     try:
-        save_router_settings(settings)
+        await asyncio.to_thread(save_router_settings, settings)
     except OSError:
         logging.getLogger(__name__).exception("Could not save router settings")
         raise HTTPException(status_code=500, detail="Could not save router settings")
     ROUTER_SETTINGS = settings
+    _compile_patterns()
     return ROUTER_SETTINGS.model_dump()
 
 
