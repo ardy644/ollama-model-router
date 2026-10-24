@@ -15,12 +15,14 @@ import shutil
 import subprocess
 import time
 import uuid
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, Security, FastAPI, HTTPException, Request
+from fastapi.security import APIKeyHeader
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -32,6 +34,34 @@ OLLAMA_BASE = "http://127.0.0.1:11434"
 OLLAMA_GENERATE = f"{OLLAMA_BASE}/api/generate"
 OLLAMA_CHAT = f"{OLLAMA_BASE}/api/chat"
 OLLAMA_TIMEOUT = 120.0  # seconds
+
+METRICS_DB_PATH = Path(__file__).with_name("metrics.db")
+
+def init_metrics_db():
+    conn = sqlite3.connect(METRICS_DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        model TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        latency_ms INTEGER
+    )''')
+    conn.commit()
+    conn.close()
+
+def log_metric(model: str, prompt_tokens: int, completion_tokens: int, latency_ms: int):
+    try:
+        conn = sqlite3.connect(METRICS_DB_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT INTO metrics (model, prompt_tokens, completion_tokens, latency_ms)
+                     VALUES (?, ?, ?, ?)''', (model, prompt_tokens, completion_tokens, latency_ms))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to log metric: {e}")
+
 
 DEFAULT_MODEL_CHOICES = [
     "gemma3:1b",
@@ -104,6 +134,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     strip_reasoning: bool = True
     context_limit: int = Field(default=2048, ge=512, le=4096)
+    images: Optional[list[str]] = None
     @field_validator("prompt")
     @classmethod
     def validate_prompt(cls, v: str) -> str:
@@ -137,6 +168,10 @@ class RouterSettings(BaseModel):
         "javascript", "typescript", "api", "endpoint", "variable", "loop", "array", "compile",
         "debug", "refactor", "git", "regex",
     ], min_length=1, max_length=100)
+    api_keys: list[str] = Field(default_factory=list)
+    large_context_model: Optional[str] = None
+    large_context_threshold: int = 2000
+
     reasoning_keywords: list[str] = Field(default_factory=lambda: [
         "solve", "calculate", "why", "step-by-step", "step by step", "logic", "evaluate", "proof",
         "theorem", "math", "equation", "reason", "derive", "deduce", "explain why", "analyze",
@@ -186,6 +221,21 @@ def load_router_settings() -> RouterSettings:
     return RouterSettings()
 
 
+_CODING_PATTERN: Optional[re.Pattern] = None
+_REASONING_PATTERN: Optional[re.Pattern] = None
+
+def _compile_patterns() -> None:
+    global _CODING_PATTERN, _REASONING_PATTERN
+    _CODING_PATTERN = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.coding_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    _REASONING_PATTERN = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.reasoning_keywords) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+
+
 def save_router_settings(settings: RouterSettings) -> None:
     temporary_path = SETTINGS_PATH.with_suffix(".tmp")
     temporary_path.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
@@ -193,6 +243,7 @@ def save_router_settings(settings: RouterSettings) -> None:
 
 
 ROUTER_SETTINGS = load_router_settings()
+_compile_patterns()
 
 
 # ---------------------------------------------------------------------------
@@ -200,19 +251,16 @@ ROUTER_SETTINGS = load_router_settings()
 # ---------------------------------------------------------------------------
 
 
-def classify_prompt(prompt: str) -> str:
-    """Route with current settings. Coding rules take priority over reasoning."""
-    coding_pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.coding_keywords) + r")(?!\w)",
-        re.IGNORECASE,
-    )
-    reasoning_pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(term) for term in ROUTER_SETTINGS.reasoning_keywords) + r")(?!\w)",
-        re.IGNORECASE,
-    )
-    if coding_pattern.search(prompt):
+def classify_prompt(prompt: str, history_len: int = 0) -> str:
+    """Route with current settings. Length takes precedence, then Coding rules, then reasoning."""
+    total_length = len(prompt) + history_len
+
+    if ROUTER_SETTINGS.large_context_model and total_length > ROUTER_SETTINGS.large_context_threshold:
+        return ROUTER_SETTINGS.large_context_model
+
+    if _CODING_PATTERN and _CODING_PATTERN.search(prompt):
         return ROUTER_SETTINGS.coding_model
-    if reasoning_pattern.search(prompt):
+    if _REASONING_PATTERN and _REASONING_PATTERN.search(prompt):
         return ROUTER_SETTINGS.reasoning_model
     return ROUTER_SETTINGS.fallback_model
 
@@ -328,11 +376,20 @@ async def lifespan(app: FastAPI):
         headers={"User-Agent": "Ollama-Router/1.0"},
     )
     app.state.http_client = client
+    init_metrics_db()
     try:
         await start_ollama_if_needed(app, client)
         yield
     finally:
         await client.aclose()
+        ollama_process = getattr(app.state, "ollama_process", None)
+        if ollama_process is not None:
+            logging.getLogger(__name__).info("Stopping automatically started Ollama server.")
+            ollama_process.terminate()
+            try:
+                ollama_process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                ollama_process.kill()
 
 
 async def get_http_client(request: Request) -> AsyncIterator[httpx.AsyncClient]:
@@ -354,9 +411,32 @@ app = FastAPI(
 )
 
 
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
+    if not ROUTER_SETTINGS.api_keys:
+        return True # Auth is disabled if no keys are set
+
+    if api_key:
+        key = api_key.replace("Bearer ", "")
+        if key in ROUTER_SETTINGS.api_keys:
+            return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or missing API Key",
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Log unexpected errors while returning a generic response to clients."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=getattr(exc, "headers", None)
+        )
+
     logging.getLogger(__name__).error(
         "Unhandled error while processing %s", request.url.path, exc_info=exc
     )
@@ -776,6 +856,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     input[type="range"] { width: 100%; accent-color: var(--accent); }
     .advanced-panel { display: none; border-top: 1px solid var(--border-color); padding-top: 16px; margin-top: 4px; }
     .advanced-panel.open { display: block; }
+    .api-key-panel { border-top: 1px solid var(--border-color); padding-top: 16px; margin-top: 16px; }
+    .attach-btn { background: transparent; border: none; color: #999; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 8px; border-radius: 50%; transition: all 0.15s; }
+    .attach-btn:hover { color: #fff; background: #444; }
     .setting-textarea {
       width: 100%; min-height: 110px; resize: vertical; box-sizing: border-box;
       background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px;
@@ -838,6 +921,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button class="icon-btn" onclick="openSettings()" title="Settings">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
+        <button class="icon-btn" onclick="exportChat()" title="Export Chat">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button class="icon-btn" onclick="openPullModal()" title="Download Model">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button class="icon-btn" onclick="openSettings()" title="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
         <a href="/docs" target="_blank" class="pill-link">API Docs ↗</a>
       </div>
     </nav>
@@ -878,6 +970,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span>Stop Generating</span>
       </button>
       <div class="input-box">
+        <button class="attach-btn" id="attach-btn" onclick="document.getElementById('file-input').click()" title="Attach image">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <input type="file" id="file-input" style="display: none;" accept="image/*" onchange="handleImageUpload(event)">
+        <div id="image-preview-container" style="display: none; align-items: center; padding: 4px; background: #333; border-radius: 8px; margin-right: 8px; position: relative;">
+          <img id="image-preview" src="" style="height: 28px; width: auto; border-radius: 4px;">
+          <button onclick="clearImage()" style="position: absolute; top: -6px; right: -6px; background: #f85149; color: white; border: none; border-radius: 50%; width: 16px; height: 16px; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center;">×</button>
+        </div>
         <textarea id="prompt-input" rows="1" placeholder="Message Ollama Model Router..."></textarea>
         <button class="send-btn" id="send-btn" onclick="submitMessage()">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
@@ -888,6 +988,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
   </main>
+
+  <!-- Pull Model Modal -->
+  <div class="modal-overlay" id="pull-modal" onclick="closePullModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-title">
+        <span>Download Model</span>
+        <button class="modal-close" onclick="closePullModal()">&times;</button>
+      </div>
+      <div class="setting-row">
+        <label class="setting-desc">Model Tag (e.g., llama3:8b)</label>
+        <input class="setting-input" id="pull-model-input" type="text" placeholder="llama3:8b">
+      </div>
+      <div class="setting-row">
+        <button class="save-settings-btn" id="pull-btn" onclick="pullModel()">Pull Model</button>
+      </div>
+      <pre id="pull-progress" style="background:#1c1c1c; padding:10px; border-radius:8px; color:#aaa; font-size:12px; display:none; max-height:200px; overflow-y:auto;"></pre>
+    </div>
+  </div>
 
   <!-- Settings Modal -->
   <div class="modal-overlay" id="settings-modal" onclick="closeSettings(event)">
@@ -999,6 +1117,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     const customSystemPrompt = document.getElementById('custom-system-prompt');
     const temperatureSlider = document.getElementById('temperature-slider');
     const temperatureValue = document.getElementById('temperature-value');
+    const clientApiKey = document.getElementById('client-api-key');
     const modelChoicesInput = document.getElementById('model-choices-input');
     const codingModelSelect = document.getElementById('coding-model-select');
     const reasoningModelSelect = document.getElementById('reasoning-model-select');
@@ -1017,6 +1136,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const savedTemperature = localStorage.getItem('router_temperature');
       if (savedTemperature && temperatureSlider) temperatureSlider.value = savedTemperature;
       if (temperatureValue && temperatureSlider) temperatureValue.textContent = Number(temperatureSlider.value).toFixed(1);
+      const savedApiKey = localStorage.getItem('router_api_key');
+      if (savedApiKey && clientApiKey) clientApiKey.value = savedApiKey;
     } catch (e) {}
 
     // 1. Attach Event Listeners FIRST so input is always responsive
@@ -1069,6 +1190,108 @@ INDEX_HTML = r"""<!DOCTYPE html>
         try { localStorage.setItem('router_temperature', temperatureSlider.value); } catch (e) {}
       });
     }
+    if (clientApiKey) {
+      clientApiKey.addEventListener('input', () => {
+        try { localStorage.setItem('router_api_key', clientApiKey.value.trim()); } catch (e) {}
+      });
+    }
+
+    function getAuthHeaders() {
+      const headers = { 'Content-Type': 'application/json' };
+      const apiKeyEl = document.getElementById('client-api-key');
+      if (apiKeyEl && apiKeyEl.value.trim()) {
+        const val = apiKeyEl.value.trim();
+        headers['Authorization'] = val.toLowerCase().startsWith('bearer ') ? val : `Bearer ${val}`;
+      }
+      return headers;
+    }
+
+    let currentImageBase64 = null;
+    function handleImageUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        currentImageBase64 = event.target.result.split(',')[1];
+        document.getElementById('image-preview').src = event.target.result;
+        document.getElementById('image-preview-container').style.display = 'flex';
+      };
+      reader.readAsDataURL(file);
+      e.target.value = '';
+    }
+    function clearImage() {
+      currentImageBase64 = null;
+      document.getElementById('image-preview-container').style.display = 'none';
+      document.getElementById('image-preview').src = '';
+    }
+
+    function exportChat() {
+      if (!currentChatId) return;
+      const chat = chats.find(c => c && c.id === currentChatId);
+      if (!chat || !chat.messages || chat.messages.length === 0) return;
+
+      let markdown = `# ${chat.title}\n\n`;
+      chat.messages.forEach(msg => {
+        const roleName = msg.role === 'user' ? 'User' : 'Assistant';
+        markdown += `### ${roleName}\n${msg.content}\n\n`;
+      });
+
+      const blob = new Blob([markdown], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${chat.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.md`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function openPullModal() { document.getElementById('pull-modal').classList.add('open'); }
+    function closePullModal() { document.getElementById('pull-modal').classList.remove('open'); }
+
+    async function pullModel() {
+      const model = document.getElementById('pull-model-input').value.trim();
+      if (!model) return;
+
+      const btn = document.getElementById('pull-btn');
+      const prog = document.getElementById('pull-progress');
+      btn.disabled = true;
+      prog.style.display = 'block';
+      prog.innerHTML = 'Starting pull...\n';
+
+      try {
+        const res = await fetch('/v1/ollama/pull', {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ model: model })
+        });
+        if (!res.ok) throw new Error('Pull failed');
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+               const data = JSON.parse(line.slice(6));
+               prog.innerHTML += data.status + (data.progress ? ` (${data.completed}/${data.total})` : '') + '\n';
+               prog.scrollTop = prog.scrollHeight;
+            }
+          }
+        }
+        prog.innerHTML += '\nDone!';
+        // refresh models
+        loadRouterSettings();
+      } catch (e) {
+        prog.innerHTML += '\nError: ' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
 
     function parseCommaList(value) {
       return String(value || '').split(',').map(item => item.trim()).filter(Boolean);
@@ -1108,7 +1331,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     async function loadRouterSettings() {
       try {
-        const response = await fetch('/v1/settings');
+        const response = await fetch('/v1/settings', { headers: getAuthHeaders() });
         if (!response.ok) throw new Error('Could not load routing settings');
         applyRouterSettings(await response.json());
       } catch (error) {
@@ -1138,7 +1361,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         try {
           const response = await fetch('/v1/settings', {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getAuthHeaders(),
             body: JSON.stringify(settings)
           });
           const result = await response.json();
@@ -1327,6 +1550,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       // 1. User Message
       const userMsg = { role: 'user', content: prompt };
+      if (currentImageBase64) {
+         userMsg.images = [currentImageBase64];
+      }
+
+      // Auto-detect Persona
+      if (!personaEl || personaEl.value === 'general') {
+         if (prompt.toLowerCase().includes('code') || prompt.toLowerCase().includes('function')) {
+            personaEl.value = 'coder';
+         } else if (prompt.toLowerCase().includes('math') || prompt.toLowerCase().includes('solve')) {
+            personaEl.value = 'reasoner';
+         }
+      }
       if (chat) {
         if (!chat.messages) chat.messages = [];
         chat.messages.push(userMsg);
@@ -1367,24 +1602,32 @@ INDEX_HTML = r"""<!DOCTYPE html>
       streamAbortController = new AbortController();
       if (stopBtn) stopBtn.style.display = 'inline-flex';
 
+
+      const requestBody = {
+        prompt: prompt,
+        history: history,
+        model: model,
+        persona: personaEl ? personaEl.value : 'general',
+        context_limit: contextLimit,
+        strip_reasoning: stripReasoning,
+        ...(advancedMode ? {
+          system_prompt: customSystemPrompt ? customSystemPrompt.value.trim() : '',
+          temperature: temperatureSlider ? Number(temperatureSlider.value) : 0.7
+        } : {}),
+        stream: true
+      };
+
+      if (currentImageBase64) {
+        requestBody.images = [currentImageBase64];
+        clearImage();
+      }
+
       try {
         const res = await fetch('/v1/chat', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders(),
           signal: streamAbortController.signal,
-          body: JSON.stringify({
-            prompt: prompt,
-            history: history,
-            model: model,
-            persona: persona,
-            context_limit: contextLimit,
-            strip_reasoning: stripReasoning,
-            ...(advancedMode ? {
-              system_prompt: customSystemPrompt ? customSystemPrompt.value.trim() : '',
-              temperature: temperatureSlider ? Number(temperatureSlider.value) : 0.7
-            } : {}),
-            stream: true
-          })
+          body: JSON.stringify(requestBody)
         });
 
         if (!res.ok) {
@@ -1682,6 +1925,7 @@ async def stream_chat_generator(
     client: httpx.AsyncClient, payload: dict, target_model: str
 ):
     """Stream token chunks from Ollama as Server-Sent Events (SSE)."""
+    start_time = time.time()
     try:
         async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
             resp.raise_for_status()
@@ -1690,6 +1934,15 @@ async def stream_chat_generator(
                     continue
                 try:
                     chunk = json.loads(line)
+                    if chunk.get("done"):
+                        latency = int((time.time() - start_time) * 1000)
+                        await asyncio.to_thread(
+                            log_metric,
+                            target_model,
+                            chunk.get("prompt_eval_count", 0),
+                            chunk.get("eval_count", 0),
+                            latency
+                        )
                     yield f"data: {json.dumps(chunk)}\n\n"
                 except Exception:
                     continue
@@ -1707,6 +1960,7 @@ async def stream_openai_generator(
 ):
     """Stream OpenAI-compatible chat completion chunks."""
     created_time = int(time.time())
+    start_time = time.time()
     try:
         async with client.stream("POST", OLLAMA_GENERATE, json=payload) as resp:
             resp.raise_for_status()
@@ -1717,6 +1971,15 @@ async def stream_openai_generator(
                     chunk = json.loads(line)
                     token = chunk.get("response", "")
                     done = chunk.get("done", False)
+                    if done:
+                        latency = int((time.time() - start_time) * 1000)
+                        await asyncio.to_thread(
+                            log_metric,
+                            target_model,
+                            chunk.get("prompt_eval_count", 0),
+                            chunk.get("eval_count", 0),
+                            latency
+                        )
 
                     event = {
                         "id": completion_id,
@@ -1750,12 +2013,14 @@ async def stream_openai_generator(
 async def chat(
     request: ChatRequest,
     client: httpx.AsyncClient = Depends(get_http_client),
+    auth: bool = Depends(verify_api_key),
 ):
     """Send a prompt to Ollama with auto-routing, persona injection, and optional streaming."""
 
     # 1. Resolve target model
     if request.model == "auto":
-        target_model = classify_prompt(request.prompt)
+        history_length = sum(len(msg.content) for msg in request.history)
+        target_model = classify_prompt(request.prompt, history_length)
     else:
         if request.model not in ROUTER_SETTINGS.model_choices:
             raise HTTPException(
@@ -1785,6 +2050,8 @@ async def chat(
     }
     if system_prompt:
         payload["system"] = system_prompt
+    if request.images:
+        payload["images"] = request.images
 
     # 4. Handle streaming mode
     if request.stream:
@@ -1794,6 +2061,7 @@ async def chat(
         )
 
     # 5. Non-streaming request
+    start_time = time.time()
     try:
         resp = await client.post(OLLAMA_GENERATE, json=payload)
         resp.raise_for_status()
@@ -1817,6 +2085,15 @@ async def chat(
 
     data = resp.json()
     response_text: str = data.get("response", "")
+
+    latency = int((time.time() - start_time) * 1000)
+    await asyncio.to_thread(
+        log_metric,
+        target_model,
+        data.get("prompt_eval_count", 0),
+        data.get("eval_count", 0),
+        latency
+    )
 
     # 6. Process <think> tags for deepseek-r1
     reasoning = None
@@ -1844,6 +2121,7 @@ async def chat(
 async def chat_completions(
     request: OpenAIChatCompletionRequest,
     client: httpx.AsyncClient = Depends(get_http_client),
+    auth: bool = Depends(verify_api_key),
 ):
     """OpenAI-compatible chat completion endpoint.
 
@@ -1869,7 +2147,8 @@ async def chat_completions(
 
     # Determine target model (auto-route using the last user prompt if auto)
     if not request.model or request.model == "auto":
-        target_model = classify_prompt(last_user_prompt)
+        history_length = sum(len(line) for line in conversation_lines)
+        target_model = classify_prompt(last_user_prompt, history_length)
     elif request.model in ROUTER_SETTINGS.model_choices:
         target_model = request.model
     else:
@@ -1911,6 +2190,7 @@ async def chat_completions(
         )
 
     # Non-streaming mode
+    start_time = time.time()
     try:
         resp = await client.post(OLLAMA_GENERATE, json=payload)
         resp.raise_for_status()
@@ -1934,6 +2214,15 @@ async def chat_completions(
 
     data = resp.json()
     response_text = data.get("response", "")
+
+    latency = int((time.time() - start_time) * 1000)
+    await asyncio.to_thread(
+        log_metric,
+        target_model,
+        data.get("prompt_eval_count", 0),
+        data.get("eval_count", 0),
+        latency
+    )
 
     return {
         "id": completion_id,
@@ -1971,19 +2260,20 @@ async def list_personas():
 @app.get("/v1/settings")
 async def get_router_settings():
     """Return editable local routing rules and configured model tags."""
-    return ROUTER_SETTINGS.model_dump()
+    return ROUTER_SETTINGS.model_dump(exclude={"api_keys"})
 
 
 @app.put("/v1/settings")
-async def update_router_settings(settings: RouterSettings):
+async def update_router_settings(settings: RouterSettings, auth: bool = Depends(verify_api_key)):
     """Validate and persist routing rules and model choices."""
     global ROUTER_SETTINGS
     try:
-        save_router_settings(settings)
+        await asyncio.to_thread(save_router_settings, settings)
     except OSError:
         logging.getLogger(__name__).exception("Could not save router settings")
         raise HTTPException(status_code=500, detail="Could not save router settings")
     ROUTER_SETTINGS = settings
+    _compile_patterns()
     return ROUTER_SETTINGS.model_dump()
 
 
@@ -2006,6 +2296,41 @@ async def list_models():
     }
 
 
+class PullRequest(BaseModel):
+    model: str
+
+@app.get("/v1/ollama/tags")
+async def get_ollama_tags(client: httpx.AsyncClient = Depends(get_http_client)):
+    try:
+        resp = await client.get(f"{OLLAMA_BASE}/api/tags", timeout=5.0)
+        resp.raise_for_status()
+        data = resp.json()
+        models = [model.get("name") for model in data.get("models", [])]
+        return {"models": models}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch models from Ollama: {str(e)}")
+
+async def stream_ollama_pull(client: httpx.AsyncClient, model: str):
+    try:
+        async with client.stream("POST", f"{OLLAMA_BASE}/api/pull", json={"model": model}) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line:
+                    yield f"data: {line}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+@app.post("/v1/ollama/pull")
+async def pull_ollama_model(
+    request: PullRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+    auth: bool = Depends(verify_api_key),
+):
+    return StreamingResponse(
+        stream_ollama_pull(client, request.model),
+        media_type="text/event-stream"
+    )
+
 # ---- GET /health ----------------------------------------------------------
 
 
@@ -2025,3 +2350,27 @@ async def health(client: httpx.AsyncClient = Depends(get_http_client)):
             "ollama_connected": ollama_ok,
         },
     )
+
+@app.get("/v1/metrics")
+async def get_metrics(limit: int = 100, auth: bool = Depends(verify_api_key)):
+    """Retrieve usage metrics."""
+    try:
+        def fetch():
+            conn = sqlite3.connect(METRICS_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM metrics ORDER BY timestamp DESC LIMIT ?", (limit,))
+            rows = [dict(row) for row in c.fetchall()]
+
+            c.execute('''SELECT model, SUM(prompt_tokens) as total_prompt,
+                         SUM(completion_tokens) as total_completion,
+                         COUNT(*) as total_requests,
+                         AVG(latency_ms) as avg_latency
+                         FROM metrics GROUP BY model''')
+            summary = [dict(row) for row in c.fetchall()]
+            conn.close()
+            return {"history": rows, "summary": summary}
+
+        return await asyncio.to_thread(fetch)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

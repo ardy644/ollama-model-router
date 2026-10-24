@@ -28,3 +28,4 @@ desktop.ini
 *.log
 router_settings.json
 router_settings.tmp
+metrics.db
